@@ -19,6 +19,63 @@ docker run --rm --network none \
   /generated/point_cloud_segmented.laz \
   /generated/aoi_with_exclusion.gpkg
 
+help_path="${results_dir}/help.txt"
+docker run --rm --network none "${image_name}" --help > "${help_path}"
+for expected_help in \
+  "Scientific parameters" \
+  "Runtime controls" \
+  "--threads" \
+  "--tile-size" \
+  "default: 20" \
+  "--grid-search-step" \
+  "default: 0.5" \
+  "--instance-dimension" \
+  "--segment-diagnostics"; do
+  grep -q -- "${expected_help}" "${help_path}"
+done
+
+run_failure_case() {
+  local name="$1"
+  local expected_message="$2"
+  local point_cloud_path="$3"
+  local aoi_path="$4"
+  local output_mode="$5"
+  shift 5
+  local output_dir="${results_dir}/failure_${name}"
+  local log_path="${results_dir}/failure_${name}.log"
+  mkdir -p "${output_dir}"
+
+  if docker run --rm --network none \
+    --user "$(id -u):$(id -g)" \
+    --volume "${repo_dir}/tests/fixtures:/fixtures:ro" \
+    --volume "${input_dir}:/in:ro" \
+    --volume "${output_dir}:/out:${output_mode}" \
+    "${image_name}" \
+    --point-cloud "${point_cloud_path}" \
+    --aoi "${aoi_path}" \
+    --output-dir /out \
+    "$@" > "${log_path}" 2>&1; then
+    echo "failure case ${name} unexpectedly succeeded" >&2
+    return 1
+  fi
+  grep -q -- "${expected_message}" "${log_path}"
+}
+
+run_failure_case missing_point "exactly one existing LAS/LAZ file" \
+  /in/missing.laz /fixtures/aoi.geojson rw
+run_failure_case point_directory "exactly one existing LAS/LAZ file" \
+  /in /fixtures/aoi.geojson rw
+run_failure_case point_extension "must have a .las or .laz extension" \
+  /fixtures/aoi.geojson /fixtures/aoi.geojson rw
+run_failure_case invalid_tile_size "--tile-size must be greater than zero" \
+  /in/point_cloud.laz /fixtures/aoi.geojson rw --tile-size 0
+run_failure_case invalid_threads "--threads must be zero or greater" \
+  /in/point_cloud.laz /fixtures/aoi.geojson rw --threads -1
+run_failure_case malformed_aoi "must contain only Polygon or MultiPolygon" \
+  /in/point_cloud.laz /fixtures/aoi_invalid.geojson rw
+run_failure_case unwritable_output "--output-dir must be writable" \
+  /in/point_cloud.laz /fixtures/aoi.geojson ro
+
 run_case() {
   local name="$1"
   local aoi_path="$2"
@@ -161,6 +218,21 @@ if len(features) != expected_tiles:
     raise SystemExit("tile GeoJSON feature count does not match the tile CSV")
 if [str(feature["properties"]["tile_id"]) for feature in features] != expected_ids:
     raise SystemExit("tile GeoJSON IDs do not match the tile CSV")
+for row, feature in zip(rows, features):
+    properties = feature["properties"]
+    for column, csv_value in row.items():
+        geojson_value = properties.get(column)
+        if csv_value == "NA":
+            if geojson_value is not None:
+                raise SystemExit(f"GeoJSON {column} does not match CSV NA")
+        elif csv_value in {"TRUE", "FALSE"}:
+            if geojson_value is not (csv_value == "TRUE"):
+                raise SystemExit(f"GeoJSON {column} does not match CSV boolean")
+        elif isinstance(geojson_value, (int, float)):
+            if abs(float(csv_value) - float(geojson_value)) > 1e-9:
+                raise SystemExit(f"GeoJSON {column} does not match CSV number")
+        elif str(geojson_value) != csv_value:
+            raise SystemExit(f"GeoJSON {column} does not match CSV value")
 
 if png_path.read_bytes()[:8] != b"\x89PNG\r\n\x1a\n":
     raise SystemExit(f"missing or invalid PNG: {png_path}")
@@ -170,6 +242,9 @@ if dtm_path.read_bytes()[:4] not in (b"II*\x00", b"MM\x00*"):
 chms = sorted(chm_dir.glob("tile_*_chm.tif")) if chm_dir.is_dir() else []
 if len(chms) != expected_tiles:
     raise SystemExit(f"expected {expected_tiles} CHMs, found {len(chms)}")
+expected_chm_names = [f"tile_{int(tile_id):06d}_chm.tif" for tile_id in expected_ids]
+if [path.name for path in chms] != expected_chm_names:
+    raise SystemExit("CHM names do not deterministically match tile IDs")
 PY
 
   if [[ "${expected_instance_dimension}" == "NA" ]]; then

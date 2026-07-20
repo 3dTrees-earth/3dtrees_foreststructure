@@ -10,41 +10,99 @@ parse_parameters <- function() {
   parser <- ArgumentParser(
     description = "Compute forest-structure indices for optimized Analysis Tiles"
   )
-  parser$add_argument(
+  required <- parser$add_argument_group("Required inputs")
+  scientific <- parser$add_argument_group("Scientific parameters")
+  runtime <- parser$add_argument_group("Runtime controls")
+  segments <- parser$add_argument_group("Optional segment controls")
+
+  required$add_argument(
     "--point-cloud", "--point_cloud",
     required = TRUE,
     help = "Path to exactly one LAS or LAZ point cloud"
   )
-  parser$add_argument(
+  required$add_argument(
     "--aoi",
     required = TRUE,
     help = "Path to one GeoJSON or GeoPackage Audit AOI"
   )
-  parser$add_argument(
+  required$add_argument(
     "--output-dir", "--output_dir",
     required = TRUE,
     help = "Existing writable output directory"
   )
-  parser$add_argument("--tile-size", "--tile_size", type = "double", default = 20)
-  parser$add_argument(
+  scientific$add_argument(
+    "--tile-size", "--tile_size",
+    type = "double",
+    default = 20,
+    help = "Fixed Analysis Tile width in metres (default: 20)"
+  )
+  scientific$add_argument(
     "--grid-search-step", "--grid_search_step",
     type = "double",
-    default = 0.5
+    default = 0.5,
+    help = "Offset-search resolution in metres; placement is always optimized (default: 0.5)"
   )
-  parser$add_argument("--ptd-resolution", "--ptd_resolution", type = "double", default = 20)
-  parser$add_argument("--dtm-resolution", "--dtm_resolution", type = "double", default = 1)
-  parser$add_argument("--maximum-height", "--maximum_height", type = "double", default = 70)
-  parser$add_argument("--voxel-resolution", "--voxel_resolution", type = "double", default = 0.2)
-  parser$add_argument(
+  scientific$add_argument(
+    "--ptd-resolution", "--ptd_resolution",
+    type = "double",
+    default = 20,
+    help = "PTD seed resolution in metres (default: 20)"
+  )
+  scientific$add_argument(
+    "--dtm-resolution", "--dtm_resolution",
+    type = "double",
+    default = 1,
+    help = "Global DTM resolution in metres (default: 1)"
+  )
+  scientific$add_argument(
+    "--maximum-height", "--maximum_height",
+    type = "double",
+    default = 70,
+    help = "Maximum normalized height retained in metres (default: 70)"
+  )
+  scientific$add_argument(
+    "--voxel-resolution", "--voxel_resolution",
+    type = "double",
+    default = 0.2,
+    help = "Voxel edge length in metres (default: 0.2)"
+  )
+  scientific$add_argument(
     "--vegetation-minimum-height", "--vegetation_minimum_height",
     type = "double",
-    default = 0.5
+    default = 0.5,
+    help = "Minimum vegetation height in metres (default: 0.5)"
   )
-  parser$add_argument("--chm-resolution", "--chm_resolution", type = "double", default = 0.5)
-  parser$add_argument("--gap-height-threshold", "--gap_height_threshold", type = "double", default = 3)
-  parser$add_argument("--chunk-size", "--chunk_size", type = "double", default = 60)
-  parser$add_argument("--dtm-buffer", "--dtm_buffer", type = "double", default = 20)
-  parser$add_argument(
+  scientific$add_argument(
+    "--chm-resolution", "--chm_resolution",
+    type = "double",
+    default = 0.5,
+    help = "Per-tile CHM resolution in metres (default: 0.5)"
+  )
+  scientific$add_argument(
+    "--gap-height-threshold", "--gap_height_threshold",
+    type = "double",
+    default = 3,
+    help = "CHM gap-height threshold in metres (default: 3)"
+  )
+  runtime$add_argument(
+    "--chunk-size", "--chunk_size",
+    type = "double",
+    default = 60,
+    help = "LAScatalog streaming chunk width in metres (default: 60)"
+  )
+  runtime$add_argument(
+    "--dtm-buffer", "--dtm_buffer",
+    type = "double",
+    default = 20,
+    help = "DTM chunk buffer in metres (default: 20)"
+  )
+  runtime$add_argument(
+    "--threads",
+    type = "integer",
+    default = 0,
+    help = "lidR thread count; 0 preserves the package/container default (default: 0)"
+  )
+  segments$add_argument(
     "--instance-dimension", "--instance_dimension",
     action = "append",
     default = NULL,
@@ -54,31 +112,35 @@ parse_parameters <- function() {
       "PredInstance_FM, treeID"
     )
   )
-  parser$add_argument(
+  segments$add_argument(
     "--segment-diagnostics", "--segment_diagnostics",
     action = "store_true",
     default = FALSE,
     help = "Write segment_diagnostics.csv (disabled by default)"
   )
-  parser$add_argument(
+  segments$add_argument(
     "--minimum-tree-voxels", "--minimum_tree_voxels",
     type = "integer",
-    default = 100
+    default = 100,
+    help = "Minimum occupied voxels for an accepted tree (default: 100)"
   )
-  parser$add_argument(
+  segments$add_argument(
     "--apex-minimum-height", "--apex_minimum_height",
     type = "double",
-    default = 3
+    default = 3,
+    help = "Strict minimum tree-apex height in metres (default: 3)"
   )
-  parser$add_argument(
+  segments$add_argument(
     "--minimum-tree-thickness", "--minimum_tree_thickness",
     type = "double",
-    default = 0.5
+    default = 0.5,
+    help = "Minimum smallest PCA extent in metres (default: 0.5)"
   )
-  parser$add_argument(
+  segments$add_argument(
     "--minimum-occupied-layers", "--minimum_occupied_layers",
     type = "integer",
-    default = 3
+    default = 3,
+    help = "Minimum occupied one-metre height layers (default: 3)"
   )
   args <- parser$parse_args()
 
@@ -118,6 +180,9 @@ parse_parameters <- function() {
   if (!dir.exists(args$output_dir)) {
     stop("--output-dir must be an existing directory")
   }
+  if (file.access(args$output_dir, mode = 2) != 0) {
+    stop("--output-dir must be writable")
+  }
 
   positive <- c(
     "tile_size", "grid_search_step", "ptd_resolution", "dtm_resolution",
@@ -149,6 +214,9 @@ parse_parameters <- function() {
   }
   if (!is.finite(args$minimum_occupied_layers) || args$minimum_occupied_layers < 1) {
     stop("--minimum-occupied-layers must be at least one")
+  }
+  if (!is.finite(args$threads) || args$threads < 0) {
+    stop("--threads must be zero or greater")
   }
   args
 }
@@ -874,6 +942,12 @@ write_layout_png <- function(aoi, tiles, edge_flags, point_cloud_name, tile_size
 
 main <- function() {
   parameters <- parse_parameters()
+  if (parameters$threads > 0) {
+    set_lidr_threads(parameters$threads)
+    message(sprintf("Using %d lidR threads", get_lidr_threads()))
+  } else {
+    message(sprintf("Using lidR default thread count: %d", get_lidr_threads()))
+  }
   aoi <- read_audit_aoi(parameters$aoi)
   tiles <- build_optimized_tiles(
     aoi$usable,

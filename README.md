@@ -51,6 +51,37 @@ to at least 100 occupied 0.2 m voxels, an apex above 3 m, a minimum 0.5 m PCA
 thickness, and at least three occupied 1 m height layers; each threshold is a
 CLI parameter.
 
+## Parameters
+
+Scientific controls retain the supplied R script's defaults:
+
+| Option | Default | Meaning |
+| --- | ---: | --- |
+| `--tile-size` | 20 m | Fixed square Analysis Tile width |
+| `--grid-search-step` | 0.5 m | Resolution of the always-on placement search |
+| `--ptd-resolution` | 20 m | PTD ground-classification seed resolution |
+| `--dtm-resolution` | 1 m | Global terrain raster resolution |
+| `--maximum-height` | 70 m | Upper normalized-height cutoff |
+| `--voxel-resolution` | 0.2 m | Structural voxel edge length |
+| `--vegetation-minimum-height` | 0.5 m | Lower vegetation cutoff |
+| `--chm-resolution` | 0.5 m | Per-tile canopy-height raster resolution |
+| `--gap-height-threshold` | 3 m | Canopy-gap threshold |
+| `--minimum-tree-voxels` | 100 | Minimum occupied voxels per accepted tree |
+| `--apex-minimum-height` | 3 m | Strict lower apex-height threshold |
+| `--minimum-tree-thickness` | 0.5 m | Minimum smallest PCA extent |
+| `--minimum-occupied-layers` | 3 | Minimum occupied 1 m height layers |
+
+Advanced/runtime controls affect execution or optional artifacts, not grid
+placement:
+
+| Option | Default | Meaning |
+| --- | ---: | --- |
+| `--chunk-size` | 60 m | LAScatalog streaming chunk width |
+| `--dtm-buffer` | 20 m | PTD/TIN chunk-edge buffer |
+| `--threads` | 0 | Preserve lidR's container default; positive values set an explicit count |
+| `--instance-dimension` | common aliases | Repeatable ordered extra-byte candidate |
+| `--segment-diagnostics` | off | Emit the optional global segment CSV |
+
 Each invocation writes:
 
 - `forest_structure_tiles.csv`: one deterministic row per valid Analysis Tile;
