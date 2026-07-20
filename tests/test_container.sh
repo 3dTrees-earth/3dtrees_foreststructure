@@ -209,6 +209,23 @@ if expect_diagnostics:
     }:
         raise SystemExit("segment diagnostics reported the wrong instance dimension")
 
+performance_path = output_dir / "forest_structure_performance.csv"
+expect_performance = output_dir.name == "aliased"
+if performance_path.exists() != expect_performance:
+    raise SystemExit("performance-report opt-in contract was not honored")
+if expect_performance:
+    with performance_path.open(newline="", encoding="utf-8") as handle:
+        performance_rows = list(csv.DictReader(handle))
+    if len(performance_rows) != 1:
+        raise SystemExit("performance report must contain exactly one summary row")
+    required_performance = {
+        "point_count", "tile_count", "peak_rss_mib", "grid_seconds",
+        "dtm_seconds", "segment_seconds", "tile_seconds", "output_seconds",
+        "total_seconds", "threads_requested", "threads_effective",
+    }
+    if required_performance.difference(performance_rows[0]):
+        raise SystemExit("performance report is missing required measurements")
+
 if not geojson_path.is_file():
     raise SystemExit(f"missing tile GeoJSON: {geojson_path}")
 with geojson_path.open(encoding="utf-8") as handle:
@@ -258,13 +275,13 @@ run_case inclusion_only /fixtures/aoi.geojson 4 /in/point_cloud.laz NA no
 run_case geojson_exclusion /fixtures/aoi_with_exclusion.geojson 3 /in/point_cloud.laz NA no
 run_case gpkg_exclusion /in/aoi_with_exclusion.gpkg 3 /in/point_cloud.laz NA no
 run_case zero_tiles /fixtures/aoi_zero_tiles.geojson 0 /in/point_cloud.laz NA no
-run_case segmented /fixtures/aoi.geojson 4 /in/point_cloud_segmented.laz PredInstance no \
-  --instance-dimension PredInstance
+run_case segmented /fixtures/aoi.geojson 4 /in/point_cloud_segmented.laz PredInstance no
 run_case aliased /fixtures/aoi.geojson 4 /in/point_cloud_segmented.laz TreeAlias yes \
   --instance-dimension MissingAlias \
   --instance-dimension TreeAlias \
   --instance-dimension PredInstance \
-  --segment-diagnostics
+  --segment-diagnostics \
+  --performance-report
 
 docker run --rm --network none \
   --user "$(id -u):$(id -g)" \

@@ -102,6 +102,12 @@ parse_parameters <- function() {
     default = 0,
     help = "lidR thread count; 0 preserves the package/container default (default: 0)"
   )
+  runtime$add_argument(
+    "--performance-report", "--performance_report",
+    action = "store_true",
+    default = FALSE,
+    help = "Write forest_structure_performance.csv with phase timings and peak RSS"
+  )
   segments$add_argument(
     "--instance-dimension", "--instance_dimension",
     action = "append",
@@ -149,7 +155,8 @@ parse_parameters <- function() {
     recursive = TRUE,
     use.names = FALSE
   )
-  if (is.null(raw_instance_dimensions) || length(raw_instance_dimensions) == 0) {
+  if (is.null(raw_instance_dimensions) || length(raw_instance_dimensions) == 0 ||
+      all(is.na(raw_instance_dimensions))) {
     args$instance_dimension <- c(
       "PredInstance", "PredInstance_SAT", "PredInstance_FM", "treeID"
     )
@@ -159,7 +166,7 @@ parse_parameters <- function() {
       ",",
       fixed = TRUE
     )))
-    args$instance_dimension <- unique(candidates[nzchar(candidates)])
+    args$instance_dimension <- unique(candidates[!is.na(candidates) & nzchar(candidates)])
     if (length(args$instance_dimension) == 0) {
       stop("--instance-dimension must contain at least one non-empty name")
     }
@@ -311,9 +318,13 @@ count_complete_tiles <- function(grid, geometry) {
 
 build_optimized_tiles <- function(geometry, tile_size, search_step) {
   offsets <- seq(0, tile_size - search_step, by = search_step)
+  maximum_possible_tiles <- ceiling(
+    as.numeric(st_area(geometry)) / tile_size^2
+  )
   best_count <- -1L
   best_x <- 0
   best_y <- 0
+  reached_upper_bound <- FALSE
 
   for (offset_x in offsets) {
     for (offset_y in offsets) {
@@ -324,7 +335,12 @@ build_optimized_tiles <- function(geometry, tile_size, search_step) {
         best_x <- offset_x
         best_y <- offset_y
       }
+      if (best_count >= maximum_possible_tiles) {
+        reached_upper_bound <- TRUE
+        break
+      }
     }
+    if (reached_upper_bound) break
   }
 
   grid <- make_grid_at(geometry, tile_size, best_x, best_y)
@@ -446,7 +462,13 @@ accumulate_segments <- function(point_cloud, dtm, chunk_size,
   catalog <- readLAScatalog(point_cloud)
   opt_chunk_size(catalog) <- chunk_size
   opt_chunk_buffer(catalog) <- 0
-  opt_select(catalog) <- "*"
+  extra_dimensions <- available_extra_dimensions(point_cloud)
+  extra_index <- match(instance_dimension, extra_dimensions) - 1L
+  opt_select(catalog) <- if (is.finite(extra_index) && extra_index == 0) {
+    "xyz0"
+  } else {
+    "*"
+  }
   opt_progress(catalog) <- FALSE
   chunks <- catalog_apply(
     catalog,
@@ -940,7 +962,62 @@ write_layout_png <- function(aoi, tiles, edge_flags, point_cloud_name, tile_size
   invisible(path)
 }
 
+elapsed_seconds <- function(started_at) {
+  unname(proc.time()[["elapsed"]] - started_at)
+}
+
+peak_rss_mib <- function() {
+  status <- tryCatch(readLines("/proc/self/status", warn = FALSE),
+    error = function(error) character())
+  line <- grep("^VmHWM:", status, value = TRUE)
+  if (length(line) == 0) return(NA_real_)
+  as.numeric(gsub("[^0-9]", "", line[[1]])) / 1024
+}
+
+write_performance_report <- function(parameters, point_count, tile_count,
+                                     instance_dimension, timings, path) {
+  report <- data.table(
+    point_cloud = basename(parameters$point_cloud),
+    point_count = point_count,
+    tile_count = tile_count,
+    instance_dimension = if (is.null(instance_dimension)) NA_character_ else instance_dimension,
+    threads_requested = parameters$threads,
+    threads_effective = get_lidr_threads(),
+    peak_rss_mib = round(peak_rss_mib(), 3),
+    grid_seconds = round(timings$grid, 6),
+    dtm_seconds = round(timings$dtm, 6),
+    segment_seconds = round(timings$segments, 6),
+    tile_seconds = round(timings$tiles, 6),
+    output_seconds = round(timings$outputs, 6),
+    total_seconds = round(timings$total, 6),
+    tile_size = parameters$tile_size,
+    grid_search_step = parameters$grid_search_step,
+    ptd_resolution = parameters$ptd_resolution,
+    dtm_resolution = parameters$dtm_resolution,
+    maximum_height = parameters$maximum_height,
+    voxel_resolution = parameters$voxel_resolution,
+    vegetation_minimum_height = parameters$vegetation_minimum_height,
+    chm_resolution = parameters$chm_resolution,
+    gap_height_threshold = parameters$gap_height_threshold,
+    minimum_tree_voxels = parameters$minimum_tree_voxels,
+    apex_minimum_height = parameters$apex_minimum_height,
+    minimum_tree_thickness = parameters$minimum_tree_thickness,
+    minimum_occupied_layers = parameters$minimum_occupied_layers,
+    chunk_size = parameters$chunk_size,
+    dtm_buffer = parameters$dtm_buffer,
+    instance_dimension_candidates = paste(parameters$instance_dimension, collapse = "|")
+  )
+  fwrite(report, path, na = "NA")
+  message(sprintf(
+    "PERF total=%.3fs grid=%.3fs dtm=%.3fs segments=%.3fs tiles=%.3fs outputs=%.3fs peak_rss=%.1fMiB",
+    timings$total, timings$grid, timings$dtm, timings$segments,
+    timings$tiles, timings$outputs, report$peak_rss_mib[[1]]
+  ))
+  invisible(path)
+}
+
 main <- function() {
+  total_started <- proc.time()[["elapsed"]]
   parameters <- parse_parameters()
   if (parameters$threads > 0) {
     set_lidr_threads(parameters$threads)
@@ -948,14 +1025,17 @@ main <- function() {
   } else {
     message(sprintf("Using lidR default thread count: %d", get_lidr_threads()))
   }
+  grid_started <- proc.time()[["elapsed"]]
   aoi <- read_audit_aoi(parameters$aoi)
   tiles <- build_optimized_tiles(
     aoi$usable,
     parameters$tile_size,
     parameters$grid_search_step
   )
+  grid_seconds <- elapsed_seconds(grid_started)
   message(sprintf("Optimized grid contains %d complete Analysis Tiles", nrow(tiles)))
 
+  dtm_started <- proc.time()[["elapsed"]]
   dtm <- build_global_dtm(
     parameters$point_cloud,
     parameters$chunk_size,
@@ -966,7 +1046,9 @@ main <- function() {
   if (is.null(dtm)) stop("global DTM generation produced no raster")
   dtm_path <- file.path(parameters$output_dir, "forest_structure_dtm.tif")
   writeRaster(dtm, dtm_path, overwrite = TRUE, filetype = "GTiff")
+  dtm_seconds <- elapsed_seconds(dtm_started)
 
+  segment_started <- proc.time()[["elapsed"]]
   instance_dimension <- select_instance_dimension(
     parameters$point_cloud,
     parameters$instance_dimension
@@ -994,6 +1076,7 @@ main <- function() {
         nrow(segments),
         sum(segments$is_tree, na.rm = TRUE)
       ))
+      rm(accumulated)
     }
   }
 
@@ -1005,6 +1088,7 @@ main <- function() {
       file.path(parameters$output_dir, "segment_diagnostics.csv")
     )
   }
+  segment_seconds <- elapsed_seconds(segment_started)
 
   chm_directory <- file.path(parameters$output_dir, "chm")
   if (!dir.exists(chm_directory) && !dir.create(chm_directory, recursive = TRUE)) {
@@ -1012,6 +1096,7 @@ main <- function() {
   }
 
   edge_flags <- compute_edge_flags(tiles, parameters$tile_size)
+  tile_started <- proc.time()[["elapsed"]]
   rows <- lapply(seq_len(nrow(tiles)), function(index) {
     chm_path <- file.path(
       chm_directory,
@@ -1037,7 +1122,9 @@ main <- function() {
   } else {
     empty_result_table()
   }
+  tile_seconds <- elapsed_seconds(tile_started)
 
+  output_started <- proc.time()[["elapsed"]]
   output_path <- file.path(parameters$output_dir, "forest_structure_tiles.csv")
   fwrite(result, output_path, na = "NA")
   write_tile_geojson(
@@ -1054,6 +1141,25 @@ main <- function() {
     parameters$tile_size,
     file.path(parameters$output_dir, "forest_structure_tiles.png")
   )
+  output_seconds <- elapsed_seconds(output_started)
+  if (parameters$performance_report) {
+    point_count <- readLASheader(parameters$point_cloud)@PHB[["Number of point records"]]
+    write_performance_report(
+      parameters,
+      point_count,
+      nrow(tiles),
+      instance_dimension,
+      list(
+        grid = grid_seconds,
+        dtm = dtm_seconds,
+        segments = segment_seconds,
+        tiles = tile_seconds,
+        outputs = output_seconds,
+        total = elapsed_seconds(total_started)
+      ),
+      file.path(parameters$output_dir, "forest_structure_performance.csv")
+    )
+  }
   message(sprintf("Wrote %d Analysis Tile rows to %s", nrow(result), output_path))
 }
 

@@ -81,6 +81,7 @@ placement:
 | `--threads` | 0 | Preserve lidR's container default; positive values set an explicit count |
 | `--instance-dimension` | common aliases | Repeatable ordered extra-byte candidate |
 | `--segment-diagnostics` | off | Emit the optional global segment CSV |
+| `--performance-report` | off | Emit phase timings, peak RSS, counts, threads, and parameters |
 
 Each invocation writes:
 
@@ -109,5 +110,16 @@ make test
 
 ## Status
 
-Complete CLI-contract validation, performance work, and the Galaxy wrapper are
-tracked as subsequent vertical slices.
+The stable container and measured performance slice are complete. The Galaxy
+wrapper remains the intentionally later integration slice.
+
+## Performance
+
+The optimized implementation stops the exact placement search as soon as it
+reaches the mathematical AOI-area upper bound and minimizes dimensions read by
+the common first-extra-byte segment path. Deterministic benchmarks measured
+31.8% lower wall time for 50,000 points/9 tiles and 14.7% lower wall time for
+500,000 points/36 tiles, with slightly lower peak RSS and no scientific output
+differences at `1e-9`. See [`benchmarks/README.md`](benchmarks/README.md) for the
+reproduction commands, measurements, rejected alternatives, and runtime
+guidance.

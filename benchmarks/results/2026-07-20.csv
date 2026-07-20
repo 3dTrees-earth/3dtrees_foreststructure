@@ -1,0 +1,7 @@
+variant,case,point_count,tile_count,threads,total_seconds,peak_rss_mib,grid_seconds,dtm_seconds,segment_seconds,tile_seconds,output_seconds
+baseline,small,50000,9,1,4.248,414.172,1.244,1.522,0.281,0.765,0.109
+optimized,small,50000,9,1,2.897,409.758,0.073,1.296,0.285,0.782,0.112
+baseline,large,500000,36,1,17.713,506.102,2.783,3.536,2.645,8.270,0.134
+optimized,large,500000,36,1,15.112,500.723,0.088,3.692,2.413,8.464,0.115
+baseline_threads4,small,50000,9,4,4.266,414.754,1.244,1.515,0.279,0.773,0.108
+baseline_threads4,large,500000,36,4,17.579,508.164,2.759,3.520,2.585,8.234,0.132
