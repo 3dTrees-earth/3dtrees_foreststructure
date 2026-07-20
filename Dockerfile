@@ -7,5 +7,6 @@ RUN install2.r --error --skipinstalled \
     rlas
 
 COPY src /opt/foreststructure
+RUN chmod -R a+rX /opt/foreststructure
 
 ENTRYPOINT ["Rscript", "/opt/foreststructure/run.R"]

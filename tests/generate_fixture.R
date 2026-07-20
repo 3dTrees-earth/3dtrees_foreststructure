@@ -4,8 +4,8 @@ suppressPackageStartupMessages({
 })
 
 arguments <- commandArgs(trailingOnly = TRUE)
-if (length(arguments) != 1) {
-  stop("usage: generate_fixture.R OUTPUT.laz")
+if (length(arguments) != 2) {
+  stop("usage: generate_fixture.R OUTPUT.laz OUTPUT.gpkg")
 }
 
 set.seed(1573)
@@ -35,4 +35,24 @@ points$Classification <- as.integer(1)
 las <- LAS(points)
 st_crs(las) <- 32632
 writeLAS(las, arguments[[1]])
+
+ring <- function(xmin, ymin, xmax, ymax) {
+  matrix(c(
+    xmin, ymin,
+    xmax, ymin,
+    xmax, ymax,
+    xmin, ymax,
+    xmin, ymin
+  ), ncol = 2, byrow = TRUE)
+}
+inclusion <- st_sf(
+  role = "include",
+  geometry = st_sfc(st_polygon(list(ring(306680, 5094480, 306720, 5094520))), crs = 32632)
+)
+exclusion <- st_sf(
+  role = "exclude",
+  geometry = st_sfc(st_polygon(list(ring(306681, 5094481, 306699, 5094499))), crs = 32632)
+)
+st_write(inclusion, arguments[[2]], layer = "include", quiet = TRUE)
+st_write(exclusion, arguments[[2]], layer = "exclude", append = TRUE, quiet = TRUE)
 

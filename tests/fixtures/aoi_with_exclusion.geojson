@@ -1,0 +1,28 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": { "role": "include" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[
+          [306680, 5094480], [306720, 5094480], [306720, 5094520],
+          [306680, 5094520], [306680, 5094480]
+        ]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "role": "exclude" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[
+          [306681, 5094481], [306699, 5094481], [306699, 5094499],
+          [306681, 5094499], [306681, 5094481]
+        ]]
+      }
+    }
+  ]
+}
+
