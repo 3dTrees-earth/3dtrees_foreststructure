@@ -44,7 +44,64 @@ parse_parameters <- function() {
   parser$add_argument("--gap-height-threshold", "--gap_height_threshold", type = "double", default = 3)
   parser$add_argument("--chunk-size", "--chunk_size", type = "double", default = 60)
   parser$add_argument("--dtm-buffer", "--dtm_buffer", type = "double", default = 20)
+  parser$add_argument(
+    "--instance-dimension", "--instance_dimension",
+    action = "append",
+    default = NULL,
+    help = paste(
+      "Ordered instance-ID dimension candidate; repeat the option or provide",
+      "comma-separated names. Defaults to PredInstance, PredInstance_SAT,",
+      "PredInstance_FM, treeID"
+    )
+  )
+  parser$add_argument(
+    "--segment-diagnostics", "--segment_diagnostics",
+    action = "store_true",
+    default = FALSE,
+    help = "Write segment_diagnostics.csv (disabled by default)"
+  )
+  parser$add_argument(
+    "--minimum-tree-voxels", "--minimum_tree_voxels",
+    type = "integer",
+    default = 100
+  )
+  parser$add_argument(
+    "--apex-minimum-height", "--apex_minimum_height",
+    type = "double",
+    default = 3
+  )
+  parser$add_argument(
+    "--minimum-tree-thickness", "--minimum_tree_thickness",
+    type = "double",
+    default = 0.5
+  )
+  parser$add_argument(
+    "--minimum-occupied-layers", "--minimum_occupied_layers",
+    type = "integer",
+    default = 3
+  )
   args <- parser$parse_args()
+
+  raw_instance_dimensions <- unlist(
+    args$instance_dimension,
+    recursive = TRUE,
+    use.names = FALSE
+  )
+  if (is.null(raw_instance_dimensions) || length(raw_instance_dimensions) == 0) {
+    args$instance_dimension <- c(
+      "PredInstance", "PredInstance_SAT", "PredInstance_FM", "treeID"
+    )
+  } else {
+    candidates <- trimws(unlist(strsplit(
+      as.character(raw_instance_dimensions),
+      ",",
+      fixed = TRUE
+    )))
+    args$instance_dimension <- unique(candidates[nzchar(candidates)])
+    if (length(args$instance_dimension) == 0) {
+      stop("--instance-dimension must contain at least one non-empty name")
+    }
+  }
 
   if (!file.exists(args$point_cloud) || dir.exists(args$point_cloud)) {
     stop("--point-cloud must be exactly one existing LAS/LAZ file")
@@ -80,6 +137,18 @@ parse_parameters <- function() {
   }
   if (!is.finite(args$gap_height_threshold) || args$gap_height_threshold < 0) {
     stop("--gap-height-threshold must be zero or greater")
+  }
+  if (!is.finite(args$minimum_tree_voxels) || args$minimum_tree_voxels < 1) {
+    stop("--minimum-tree-voxels must be at least one")
+  }
+  if (!is.finite(args$apex_minimum_height) || args$apex_minimum_height < 0) {
+    stop("--apex-minimum-height must be zero or greater")
+  }
+  if (!is.finite(args$minimum_tree_thickness) || args$minimum_tree_thickness < 0) {
+    stop("--minimum-tree-thickness must be zero or greater")
+  }
+  if (!is.finite(args$minimum_occupied_layers) || args$minimum_occupied_layers < 1) {
+    stop("--minimum-occupied-layers must be at least one")
   }
   args
 }
@@ -258,6 +327,259 @@ build_global_dtm <- function(point_cloud, chunk_size, dtm_buffer,
   result
 }
 
+available_extra_dimensions <- function(point_cloud) {
+  header <- readLASheader(point_cloud)
+  extra_bytes <- header@VLR$Extra_Bytes[["Extra Bytes Description"]]
+  if (is.null(extra_bytes) || length(extra_bytes) == 0) return(character())
+  unique(vapply(extra_bytes, function(description) {
+    as.character(description$name)
+  }, character(1)))
+}
+
+select_instance_dimension <- function(point_cloud, candidates) {
+  available <- available_extra_dimensions(point_cloud)
+  selected <- candidates[candidates %in% available]
+  if (length(selected) == 0) return(NULL)
+  selected[[1]]
+}
+
+segment_chunk <- function(chunk, dtm, voxel_resolution, maximum_height,
+                          instance_dimension) {
+  las <- readLAS(chunk)
+  if (is.empty(las) || !instance_dimension %in% names(las@data)) return(NULL)
+  las <- normalize_height(las, dtm)
+  source <- as.data.table(las@data)
+  source[, instance_id := get(instance_dimension)]
+  source <- source[
+    is.finite(instance_id) & instance_id > 0 &
+      is.finite(Z) & Z >= 0 & Z <= maximum_height,
+    .(X, Y, Z, instance_id)
+  ]
+  if (nrow(source) == 0) return(NULL)
+
+  apex <- source[source[, .I[which.max(Z)], by = instance_id]$V1,
+    .(instance_id, apex_x = X, apex_y = Y, apex_z = Z)]
+  source[, `:=`(
+    voxel_x = floor(X / voxel_resolution),
+    voxel_y = floor(Y / voxel_resolution),
+    voxel_z = floor(Z / voxel_resolution)
+  )]
+
+  list(
+    voxels = unique(source[, .(instance_id, voxel_x, voxel_y, voxel_z)]),
+    layers = unique(source[, .(instance_id, occupied_layer = floor(Z))]),
+    apex = apex
+  )
+}
+
+accumulate_segments <- function(point_cloud, dtm, chunk_size,
+                                voxel_resolution, maximum_height,
+                                instance_dimension) {
+  catalog <- readLAScatalog(point_cloud)
+  opt_chunk_size(catalog) <- chunk_size
+  opt_chunk_buffer(catalog) <- 0
+  opt_select(catalog) <- "*"
+  opt_progress(catalog) <- FALSE
+  chunks <- catalog_apply(
+    catalog,
+    segment_chunk,
+    dtm = dtm,
+    voxel_resolution = voxel_resolution,
+    maximum_height = maximum_height,
+    instance_dimension = instance_dimension,
+    .options = list(automerge = FALSE)
+  )
+  chunks <- Filter(Negate(is.null), chunks)
+  if (length(chunks) == 0) return(NULL)
+
+  voxels <- unique(rbindlist(lapply(chunks, `[[`, "voxels")))
+  layers <- unique(rbindlist(lapply(chunks, `[[`, "layers")))
+  apex <- rbindlist(lapply(chunks, `[[`, "apex"))
+  apex <- apex[apex[, .I[which.max(apex_z)], by = instance_id]$V1]
+  list(voxels = voxels, layers = layers, apex = apex)
+}
+
+finalize_segments <- function(accumulated, parameters) {
+  voxels <- accumulated$voxels
+  layers <- accumulated$layers
+  apex <- accumulated$apex
+
+  voxel_metrics <- voxels[, .(n_vox = .N), by = instance_id]
+  voxel_metrics[, voxel_volume := n_vox * parameters$voxel_resolution^3]
+  crown_metrics <- voxels[, .(
+    crown_area = uniqueN(data.table(voxel_x, voxel_y)) *
+      parameters$voxel_resolution^2
+  ), by = instance_id]
+  layer_metrics <- layers[, .(
+    n_occupied_layers = uniqueN(occupied_layer)
+  ), by = instance_id]
+  extent_metrics <- voxels[, {
+    if (.N < 3) {
+      .(pca_extent_1 = NA_real_, pca_extent_2 = NA_real_, pca_extent_3 = NA_real_)
+    } else {
+      coordinates <- as.matrix(.SD) * parameters$voxel_resolution
+      extents <- tryCatch({
+        rotated <- prcomp(coordinates, center = TRUE)$x
+        apply(rotated, 2, function(values) diff(range(values)))
+      }, error = function(error) rep(NA_real_, 3))
+      .(
+        pca_extent_1 = extents[[1]],
+        pca_extent_2 = extents[[2]],
+        pca_extent_3 = extents[[3]]
+      )
+    }
+  }, by = instance_id, .SDcols = c("voxel_x", "voxel_y", "voxel_z")]
+
+  segments <- Reduce(
+    function(left, right) merge(left, right, by = "instance_id", all = TRUE),
+    list(apex, voxel_metrics, crown_metrics, layer_metrics, extent_metrics)
+  )
+  segments[, `:=`(
+    pass_voxels = n_vox >= parameters$minimum_tree_voxels,
+    pass_apex = apex_z > parameters$apex_minimum_height,
+    pass_thickness = !is.na(pca_extent_3) &
+      pca_extent_3 >= parameters$minimum_tree_thickness,
+    pass_occupied_layers = n_occupied_layers >= parameters$minimum_occupied_layers
+  )]
+  segments[, is_tree := pass_voxels & pass_apex &
+    pass_thickness & pass_occupied_layers]
+  segments[, fail_reason := paste0(
+    ifelse(!pass_voxels, "voxels ", ""),
+    ifelse(!pass_apex, "apex ", ""),
+    ifelse(!pass_thickness, "thickness ", ""),
+    ifelse(!pass_occupied_layers, "layers ", "")
+  )]
+  segments
+}
+
+assign_segments_to_tiles <- function(segments, tiles) {
+  if (is.null(segments)) return(NULL)
+  segments[, tile_id := NA_integer_]
+  if (nrow(tiles) == 0) return(segments)
+
+  bounds <- t(vapply(seq_len(nrow(tiles)), function(index) {
+    as.numeric(st_bbox(tiles[index, ]))
+  }, numeric(4)))
+  colnames(bounds) <- c("xmin", "ymin", "xmax", "ymax")
+  segments[, tile_id := mapply(function(apex_x, apex_y) {
+    matches <- which(
+      apex_x >= bounds[, "xmin"] & apex_x < bounds[, "xmax"] &
+        apex_y >= bounds[, "ymin"] & apex_y < bounds[, "ymax"]
+    )
+    if (length(matches) == 0) NA_integer_ else tiles$tile_id[[matches[[1]]]]
+  }, apex_x, apex_y)]
+  segments
+}
+
+gini <- function(values) {
+  values <- values[!is.na(values)]
+  count <- length(values)
+  if (count < 2) return(NA_real_)
+  if (any(values < 0)) values <- values - min(values)
+  values <- sort(values)
+  total <- sum(values)
+  if (total == 0) return(0)
+  coefficient <- (2 * sum(seq_len(count) * values) / (count * total)) -
+    (count + 1) / count
+  coefficient * count / (count - 1)
+}
+
+empty_tree_metrics <- function() {
+  list(
+    n_seg_total = NA_integer_,
+    n_trees = NA_integer_,
+    tree_height_max = NA_real_,
+    tree_height_mean = NA_real_,
+    tree_height_gini = NA_real_,
+    tree_crownarea_mean = NA_real_,
+    tree_crownarea_max = NA_real_,
+    tree_crownarea_gini = NA_real_,
+    tree_volume_mean = NA_real_,
+    tree_volume_max = NA_real_,
+    tree_volume_gini = NA_real_
+  )
+}
+
+tree_metrics_for_tile <- function(segments, tile_id) {
+  if (is.null(segments)) return(empty_tree_metrics())
+  target_tile_id <- tile_id
+  in_tile <- segments[segments$tile_id == target_tile_id]
+  trees <- in_tile[is_tree == TRUE]
+  metrics <- empty_tree_metrics()
+  metrics$n_seg_total <- nrow(in_tile)
+  metrics$n_trees <- nrow(trees)
+  if (nrow(trees) == 0) return(metrics)
+
+  metrics$tree_height_max <- safe_round(max(trees$apex_z))
+  metrics$tree_height_mean <- safe_round(mean(trees$apex_z))
+  metrics$tree_height_gini <- safe_round(gini(trees$apex_z))
+  metrics$tree_crownarea_mean <- safe_round(mean(trees$crown_area))
+  metrics$tree_crownarea_max <- safe_round(max(trees$crown_area))
+  metrics$tree_crownarea_gini <- safe_round(gini(trees$crown_area))
+  metrics$tree_volume_mean <- safe_round(mean(trees$voxel_volume))
+  metrics$tree_volume_max <- safe_round(max(trees$voxel_volume))
+  metrics$tree_volume_gini <- safe_round(gini(trees$voxel_volume))
+  metrics
+}
+
+empty_segment_diagnostics <- function() {
+  data.table(
+    point_cloud = character(),
+    instance_dimension = character(),
+    instance_id = numeric(),
+    tile_id = integer(),
+    n_vox = integer(),
+    voxel_volume = numeric(),
+    crown_area = numeric(),
+    apex_x = numeric(),
+    apex_y = numeric(),
+    apex_z = numeric(),
+    pca_extent_1 = numeric(),
+    pca_extent_2 = numeric(),
+    pca_extent_3 = numeric(),
+    n_occupied_layers = integer(),
+    pass_voxels = logical(),
+    pass_apex = logical(),
+    pass_thickness = logical(),
+    pass_occupied_layers = logical(),
+    is_tree = logical(),
+    fail_reason = character(),
+    apex_in_tile = logical()
+  )
+}
+
+write_segment_diagnostics <- function(segments, point_cloud, instance_dimension,
+                                      path) {
+  diagnostics <- empty_segment_diagnostics()
+  if (!is.null(segments) && nrow(segments) > 0) {
+    diagnostics <- segments[, .(
+      point_cloud = basename(point_cloud),
+      instance_dimension = instance_dimension,
+      instance_id,
+      tile_id,
+      n_vox,
+      voxel_volume = round(voxel_volume, 4),
+      crown_area = round(crown_area, 4),
+      apex_x = round(apex_x, 4),
+      apex_y = round(apex_y, 4),
+      apex_z = round(apex_z, 4),
+      pca_extent_1 = round(pca_extent_1, 4),
+      pca_extent_2 = round(pca_extent_2, 4),
+      pca_extent_3 = round(pca_extent_3, 4),
+      n_occupied_layers,
+      pass_voxels,
+      pass_apex,
+      pass_thickness,
+      pass_occupied_layers,
+      is_tree,
+      fail_reason,
+      apex_in_tile = !is.na(tile_id)
+    )]
+  }
+  fwrite(diagnostics, path, na = "NA")
+  invisible(path)
+}
+
 empty_metric_values <- function(voxel_total) {
   list(
     vox_filled = 0L,
@@ -418,7 +740,7 @@ calculate_tile_metrics <- function(point_cloud, tile, dtm, parameters, chm_outpu
   )
 }
 
-build_tile_row <- function(point_cloud_name, tile, edge_tile, metrics) {
+build_tile_row <- function(point_cloud_name, tile, edge_tile, metrics, tree_metrics) {
   bounds <- st_bbox(tile)
   as.data.table(c(list(
     point_cloud = point_cloud_name,
@@ -426,7 +748,7 @@ build_tile_row <- function(point_cloud_name, tile, edge_tile, metrics) {
     tile_xmin = as.numeric(bounds[["xmin"]]),
     tile_ymin = as.numeric(bounds[["ymin"]]),
     edge_tile = edge_tile
-  ), metrics))
+  ), metrics, tree_metrics))
 }
 
 empty_result_table <- function() {
@@ -450,7 +772,18 @@ empty_result_table <- function() {
     chm_sd = numeric(),
     chm_cv = numeric(),
     height_max = numeric(),
-    height_mean = numeric()
+    height_mean = numeric(),
+    n_seg_total = integer(),
+    n_trees = integer(),
+    tree_height_max = numeric(),
+    tree_height_mean = numeric(),
+    tree_height_gini = numeric(),
+    tree_crownarea_mean = numeric(),
+    tree_crownarea_max = numeric(),
+    tree_crownarea_gini = numeric(),
+    tree_volume_mean = numeric(),
+    tree_volume_max = numeric(),
+    tree_volume_gini = numeric()
   )
 }
 
@@ -560,6 +893,45 @@ main <- function() {
   dtm_path <- file.path(parameters$output_dir, "forest_structure_dtm.tif")
   writeRaster(dtm, dtm_path, overwrite = TRUE, filetype = "GTiff")
 
+  instance_dimension <- select_instance_dimension(
+    parameters$point_cloud,
+    parameters$instance_dimension
+  )
+  segments <- NULL
+  if (is.null(instance_dimension)) {
+    message("No configured Instance Dimension found; tree and segment metrics will be NA")
+  } else {
+    message(sprintf("Using Instance Dimension: %s", instance_dimension))
+    accumulated <- accumulate_segments(
+      parameters$point_cloud,
+      dtm,
+      parameters$chunk_size,
+      parameters$voxel_resolution,
+      parameters$maximum_height,
+      instance_dimension
+    )
+    if (!is.null(accumulated)) {
+      segments <- assign_segments_to_tiles(
+        finalize_segments(accumulated, parameters),
+        tiles
+      )
+      message(sprintf(
+        "Global segment pass found %d segments (%d accepted trees)",
+        nrow(segments),
+        sum(segments$is_tree, na.rm = TRUE)
+      ))
+    }
+  }
+
+  if (parameters$segment_diagnostics) {
+    write_segment_diagnostics(
+      segments,
+      parameters$point_cloud,
+      if (is.null(instance_dimension)) NA_character_ else instance_dimension,
+      file.path(parameters$output_dir, "segment_diagnostics.csv")
+    )
+  }
+
   chm_directory <- file.path(parameters$output_dir, "chm")
   if (!dir.exists(chm_directory) && !dir.create(chm_directory, recursive = TRUE)) {
     stop("could not create CHM output directory")
@@ -582,7 +954,8 @@ main <- function() {
       basename(parameters$point_cloud),
       tiles[index, ],
       edge_flags[[index]],
-      metrics
+      metrics,
+      tree_metrics_for_tile(segments, tiles$tile_id[[index]])
     )
   })
   result <- if (length(rows)) {

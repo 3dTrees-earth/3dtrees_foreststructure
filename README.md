@@ -37,6 +37,20 @@ Its grid-search resolution is configurable with `--grid-search-step` and
 defaults to 0.5 m. Run the image with `--help` to inspect all available
 scientific and runtime parameters and their defaults.
 
+Tree metrics are optional. Repeat `--instance-dimension` to provide candidate
+extra-byte names in priority order (comma-separated names are also accepted).
+The first name present in the LAS/LAZ header is used for one global segment
+pass; the defaults are `PredInstance`, `PredInstance_SAT`, `PredInstance_FM`,
+and `treeID`. If none exists, the run still succeeds and every tree/segment
+field in the tile CSV is `NA`. Trees are aggregated globally and assigned to
+exactly one tile by their apex, including trees spanning tile boundaries.
+
+Use `--segment-diagnostics` to additionally write
+`segment_diagnostics.csv`. It is omitted by default. Tree filtering defaults
+to at least 100 occupied 0.2 m voxels, an apex above 3 m, a minimum 0.5 m PCA
+thickness, and at least three occupied 1 m height layers; each threshold is a
+CLI parameter.
+
 Each invocation writes:
 
 - `forest_structure_tiles.csv`: one deterministic row per valid Analysis Tile;
@@ -64,5 +78,5 @@ make test
 
 ## Status
 
-Optional Instance Dimension metrics, segment diagnostics, performance work,
-and the Galaxy wrapper are tracked as subsequent vertical slices.
+Complete CLI-contract validation, performance work, and the Galaxy wrapper are
+tracked as subsequent vertical slices.

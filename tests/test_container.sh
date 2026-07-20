@@ -16,13 +16,19 @@ docker run --rm --network none \
   "${image_name}" \
   /tests/generate_fixture.R \
   /generated/point_cloud.laz \
+  /generated/point_cloud_segmented.laz \
   /generated/aoi_with_exclusion.gpkg
 
 run_case() {
   local name="$1"
   local aoi_path="$2"
   local expected_tiles="$3"
+  local point_cloud_path="$4"
+  local expected_instance_dimension="$5"
+  local expect_diagnostics="$6"
+  shift 6
   local output_dir="${results_dir}/${name}"
+  local log_path="${output_dir}/container.log"
   mkdir -p "${output_dir}"
 
   docker run --rm --network none \
@@ -31,11 +37,16 @@ run_case() {
     --volume "${input_dir}:/in:ro" \
     --volume "${output_dir}:/out" \
     "${image_name}" \
-    --point-cloud /in/point_cloud.laz \
+    --point-cloud "${point_cloud_path}" \
     --aoi "${aoi_path}" \
-    --output-dir /out
+    --output-dir /out \
+    "$@" 2>&1 | tee "${log_path}"
 
-  python - "${output_dir}" "${expected_tiles}" <<'PY'
+  python - \
+    "${output_dir}" \
+    "${expected_tiles}" \
+    "${expected_instance_dimension}" \
+    "${expect_diagnostics}" <<'PY'
 import csv
 import json
 import pathlib
@@ -43,6 +54,8 @@ import sys
 
 output_dir = pathlib.Path(sys.argv[1])
 expected_tiles = int(sys.argv[2])
+expected_instance_dimension = sys.argv[3]
+expect_diagnostics = sys.argv[4] == "yes"
 csv_path = output_dir / "forest_structure_tiles.csv"
 geojson_path = output_dir / "forest_structure_tiles.geojson"
 png_path = output_dir / "forest_structure_tiles.png"
@@ -78,6 +91,17 @@ required = {
     "chm_cv",
     "height_max",
     "height_mean",
+    "n_seg_total",
+    "n_trees",
+    "tree_height_max",
+    "tree_height_mean",
+    "tree_height_gini",
+    "tree_crownarea_mean",
+    "tree_crownarea_max",
+    "tree_crownarea_gini",
+    "tree_volume_mean",
+    "tree_volume_max",
+    "tree_volume_gini",
 }
 missing = required.difference(fieldnames)
 if missing:
@@ -91,6 +115,42 @@ if len(rows) != expected_tiles:
 expected_ids = [str(index) for index in range(1, expected_tiles + 1)]
 if [row["tile_id"] for row in rows] != expected_ids:
     raise SystemExit("tile IDs are not deterministic")
+
+tree_columns = {
+    "n_seg_total",
+    "n_trees",
+    "tree_height_max",
+    "tree_height_mean",
+    "tree_height_gini",
+    "tree_crownarea_mean",
+    "tree_crownarea_max",
+    "tree_crownarea_gini",
+    "tree_volume_mean",
+    "tree_volume_max",
+    "tree_volume_gini",
+}
+if expected_instance_dimension == "NA":
+    if any(row[column] != "NA" for row in rows for column in tree_columns):
+        raise SystemExit("tree fields must be NA when no instance dimension exists")
+elif expected_instance_dimension == "PredInstance":
+    if sum(int(row["n_trees"]) for row in rows) != 2:
+        raise SystemExit("cross-tile PredInstance trees were not counted exactly once")
+elif expected_instance_dimension == "TreeAlias":
+    if sum(int(row["n_trees"]) for row in rows) != 1:
+        raise SystemExit("ordered Instance Dimension fallback was not honored")
+
+diagnostics_path = output_dir / "segment_diagnostics.csv"
+if diagnostics_path.exists() != expect_diagnostics:
+    raise SystemExit("segment diagnostics opt-in contract was not honored")
+if expect_diagnostics:
+    with diagnostics_path.open(newline="", encoding="utf-8") as handle:
+        diagnostics = list(csv.DictReader(handle))
+    if not diagnostics:
+        raise SystemExit("segment diagnostics must contain global segment rows")
+    if {row["instance_dimension"] for row in diagnostics} != {
+        expected_instance_dimension
+    }:
+        raise SystemExit("segment diagnostics reported the wrong instance dimension")
 
 if not geojson_path.is_file():
     raise SystemExit(f"missing tile GeoJSON: {geojson_path}")
@@ -111,12 +171,25 @@ chms = sorted(chm_dir.glob("tile_*_chm.tif")) if chm_dir.is_dir() else []
 if len(chms) != expected_tiles:
     raise SystemExit(f"expected {expected_tiles} CHMs, found {len(chms)}")
 PY
+
+  if [[ "${expected_instance_dimension}" == "NA" ]]; then
+    grep -q "No configured Instance Dimension found" "${log_path}"
+  else
+    grep -q "Using Instance Dimension: ${expected_instance_dimension}" "${log_path}"
+  fi
 }
 
-run_case inclusion_only /fixtures/aoi.geojson 4
-run_case geojson_exclusion /fixtures/aoi_with_exclusion.geojson 3
-run_case gpkg_exclusion /in/aoi_with_exclusion.gpkg 3
-run_case zero_tiles /fixtures/aoi_zero_tiles.geojson 0
+run_case inclusion_only /fixtures/aoi.geojson 4 /in/point_cloud.laz NA no
+run_case geojson_exclusion /fixtures/aoi_with_exclusion.geojson 3 /in/point_cloud.laz NA no
+run_case gpkg_exclusion /in/aoi_with_exclusion.gpkg 3 /in/point_cloud.laz NA no
+run_case zero_tiles /fixtures/aoi_zero_tiles.geojson 0 /in/point_cloud.laz NA no
+run_case segmented /fixtures/aoi.geojson 4 /in/point_cloud_segmented.laz PredInstance no \
+  --instance-dimension PredInstance
+run_case aliased /fixtures/aoi.geojson 4 /in/point_cloud_segmented.laz TreeAlias yes \
+  --instance-dimension MissingAlias \
+  --instance-dimension TreeAlias \
+  --instance-dimension PredInstance \
+  --segment-diagnostics
 
 docker run --rm --network none \
   --user "$(id -u):$(id -g)" \

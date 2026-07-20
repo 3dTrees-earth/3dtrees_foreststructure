@@ -5,7 +5,7 @@ if (length(arguments) != 1) stop("usage: verify_rasters.R RESULTS_DIR")
 results_dir <- arguments[[1]]
 
 case_directories <- list.dirs(results_dir, recursive = FALSE, full.names = TRUE)
-if (length(case_directories) != 4) stop("unexpected number of acceptance cases")
+if (length(case_directories) != 6) stop("unexpected number of acceptance cases")
 
 for (output_dir in case_directories) {
   csv <- read.csv(file.path(output_dir, "forest_structure_tiles.csv"), na.strings = "NA")
