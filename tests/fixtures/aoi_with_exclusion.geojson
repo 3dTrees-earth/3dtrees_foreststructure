@@ -3,7 +3,7 @@
   "features": [
     {
       "type": "Feature",
-      "properties": { "role": "include" },
+      "properties": { "role": "inclusion" },
       "geometry": {
         "type": "Polygon",
         "coordinates": [[
@@ -14,7 +14,7 @@
     },
     {
       "type": "Feature",
-      "properties": { "role": "exclude" },
+      "properties": { "role": "exclusion" },
       "geometry": {
         "type": "Polygon",
         "coordinates": [[
@@ -25,4 +25,3 @@
     }
   ]
 }
-

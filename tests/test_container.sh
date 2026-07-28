@@ -3,12 +3,21 @@ set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 image_name="${FORESTSTRUCTURE_IMAGE:-3dtrees-foreststructure:test}"
+docker_limits=(--cpus "${FORESTSTRUCTURE_CPUS:-10}" --memory "${FORESTSTRUCTURE_MEMORY:-100g}")
 input_dir="$(mktemp -d)"
 results_dir="$(mktemp -d)"
 trap 'rm -rf "${input_dir}" "${results_dir}"' EXIT
 
 docker build --tag "${image_name}" "${repo_dir}"
 docker run --rm --network none \
+  "${docker_limits[@]}" \
+  --entrypoint Rscript \
+  --volume "${repo_dir}:/workspace:ro" \
+  --workdir /workspace \
+  "${image_name}" \
+  tests/test_tile_scheduler.R
+docker run --rm --network none \
+  "${docker_limits[@]}" \
   --user "$(id -u):$(id -g)" \
   --entrypoint Rscript \
   --volume "${repo_dir}/tests:/tests:ro" \
@@ -20,8 +29,10 @@ docker run --rm --network none \
   /generated/aoi_with_exclusion.gpkg
 
 help_path="${results_dir}/help.txt"
-docker run --rm --network none "${image_name}" --help > "${help_path}"
+docker run --rm --network none "${docker_limits[@]}" "${image_name}" --help > "${help_path}"
 for expected_help in \
+  "Optional GeoJSON or GeoPackage Audit AOI" \
+  "omitted, tiles cover the complete" \
   "Scientific parameters" \
   "Runtime controls" \
   "--threads" \
@@ -46,6 +57,7 @@ run_failure_case() {
   mkdir -p "${output_dir}"
 
   if docker run --rm --network none \
+    "${docker_limits[@]}" \
     --user "$(id -u):$(id -g)" \
     --volume "${repo_dir}/tests/fixtures:/fixtures:ro" \
     --volume "${input_dir}:/in:ro" \
@@ -73,6 +85,8 @@ run_failure_case invalid_threads "--threads must be zero or greater" \
   /in/point_cloud.laz /fixtures/aoi.geojson rw --threads -1
 run_failure_case malformed_aoi "must contain only Polygon or MultiPolygon" \
   /in/point_cloud.laz /fixtures/aoi_invalid.geojson rw
+run_failure_case nonoverlap_aoi "does not overlap the point-cloud XY extent" \
+  /in/point_cloud.laz /fixtures/aoi_nonoverlap.geojson rw
 run_failure_case unwritable_output "--output-dir must be writable" \
   /in/point_cloud.laz /fixtures/aoi.geojson ro
 
@@ -86,16 +100,24 @@ run_case() {
   shift 6
   local output_dir="${results_dir}/${name}"
   local log_path="${output_dir}/container.log"
+  local expected_footprint_source="audit_aoi"
+  local -a aoi_arguments=()
+  if [[ "${aoi_path}" == "NONE" ]]; then
+    expected_footprint_source="point_cloud_extent"
+  else
+    aoi_arguments=(--aoi "${aoi_path}")
+  fi
   mkdir -p "${output_dir}"
 
   docker run --rm --network none \
+    "${docker_limits[@]}" \
     --user "$(id -u):$(id -g)" \
     --volume "${repo_dir}/tests/fixtures:/fixtures:ro" \
     --volume "${input_dir}:/in:ro" \
     --volume "${output_dir}:/out" \
     "${image_name}" \
     --point-cloud "${point_cloud_path}" \
-    --aoi "${aoi_path}" \
+    "${aoi_arguments[@]}" \
     --output-dir /out \
     "$@" 2>&1 | tee "${log_path}"
 
@@ -103,7 +125,8 @@ run_case() {
     "${output_dir}" \
     "${expected_tiles}" \
     "${expected_instance_dimension}" \
-    "${expect_diagnostics}" <<'PY'
+    "${expect_diagnostics}" \
+    "${expected_footprint_source}" <<'PY'
 import csv
 import json
 import pathlib
@@ -113,6 +136,7 @@ output_dir = pathlib.Path(sys.argv[1])
 expected_tiles = int(sys.argv[2])
 expected_instance_dimension = sys.argv[3]
 expect_diagnostics = sys.argv[4] == "yes"
+expected_footprint_source = sys.argv[5]
 csv_path = output_dir / "forest_structure_tiles.csv"
 geojson_path = output_dir / "forest_structure_tiles.geojson"
 png_path = output_dir / "forest_structure_tiles.png"
@@ -210,7 +234,7 @@ if expect_diagnostics:
         raise SystemExit("segment diagnostics reported the wrong instance dimension")
 
 performance_path = output_dir / "forest_structure_performance.csv"
-expect_performance = output_dir.name == "aliased"
+expect_performance = output_dir.name in {"aliased", "whole_cloud"}
 if performance_path.exists() != expect_performance:
     raise SystemExit("performance-report opt-in contract was not honored")
 if expect_performance:
@@ -219,12 +243,14 @@ if expect_performance:
     if len(performance_rows) != 1:
         raise SystemExit("performance report must contain exactly one summary row")
     required_performance = {
-        "point_count", "tile_count", "peak_rss_mib", "grid_seconds",
+        "footprint_source", "point_count", "tile_count", "peak_rss_mib", "grid_seconds",
         "dtm_seconds", "segment_seconds", "tile_seconds", "output_seconds",
         "total_seconds", "threads_requested", "threads_effective",
     }
     if required_performance.difference(performance_rows[0]):
         raise SystemExit("performance report is missing required measurements")
+    if performance_rows[0]["footprint_source"] != expected_footprint_source:
+        raise SystemExit("performance report has the wrong footprint source")
 
 if not geojson_path.is_file():
     raise SystemExit(f"missing tile GeoJSON: {geojson_path}")
@@ -269,8 +295,12 @@ PY
   else
     grep -q "Using Instance Dimension: ${expected_instance_dimension}" "${log_path}"
   fi
+  if [[ "${expected_footprint_source}" == "point_cloud_extent" ]]; then
+    grep -q "covering the complete point-cloud XY extent" "${log_path}"
+  fi
 }
 
+run_case whole_cloud NONE 9 /in/point_cloud.laz NA no --performance-report
 run_case inclusion_only /fixtures/aoi.geojson 4 /in/point_cloud.laz NA no
 run_case geojson_exclusion /fixtures/aoi_with_exclusion.geojson 3 /in/point_cloud.laz NA no
 run_case gpkg_exclusion /in/aoi_with_exclusion.gpkg 3 /in/point_cloud.laz NA no
@@ -284,6 +314,7 @@ run_case aliased /fixtures/aoi.geojson 4 /in/point_cloud_segmented.laz TreeAlias
   --performance-report
 
 docker run --rm --network none \
+  "${docker_limits[@]}" \
   --user "$(id -u):$(id -g)" \
   --entrypoint Rscript \
   --volume "${repo_dir}/tests:/tests:ro" \

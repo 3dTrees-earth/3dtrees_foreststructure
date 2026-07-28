@@ -6,26 +6,42 @@ suppressPackageStartupMessages({
   library(terra)
 })
 
+script_argument <- grep(
+  "^--file=",
+  commandArgs(trailingOnly = FALSE),
+  value = TRUE
+)
+script_directory <- if (length(script_argument)) {
+  dirname(normalizePath(sub("^--file=", "", script_argument[[1]])))
+} else {
+  getwd()
+}
+source(file.path(script_directory, "tile_scheduler.R"))
+
 parse_parameters <- function() {
   parser <- ArgumentParser(
     description = "Compute forest-structure indices for optimized Analysis Tiles"
   )
-  required <- parser$add_argument_group("Required inputs")
+  inputs <- parser$add_argument_group("Inputs")
   scientific <- parser$add_argument_group("Scientific parameters")
   runtime <- parser$add_argument_group("Runtime controls")
   segments <- parser$add_argument_group("Optional segment controls")
 
-  required$add_argument(
+  inputs$add_argument(
     "--point-cloud", "--point_cloud",
     required = TRUE,
     help = "Path to exactly one LAS or LAZ point cloud"
   )
-  required$add_argument(
+  inputs$add_argument(
     "--aoi",
-    required = TRUE,
-    help = "Path to one GeoJSON or GeoPackage Audit AOI"
+    required = FALSE,
+    default = NULL,
+    help = paste(
+      "Optional GeoJSON or GeoPackage Audit AOI; when omitted, tiles cover",
+      "the complete point-cloud XY extent"
+    )
   )
-  required$add_argument(
+  inputs$add_argument(
     "--output-dir", "--output_dir",
     required = TRUE,
     help = "Existing writable output directory"
@@ -178,11 +194,13 @@ parse_parameters <- function() {
   if (!grepl("\\.la[sz]$", args$point_cloud, ignore.case = TRUE)) {
     stop("--point-cloud must have a .las or .laz extension")
   }
-  if (!file.exists(args$aoi) || dir.exists(args$aoi)) {
-    stop("--aoi must be exactly one existing GeoJSON or GeoPackage file")
-  }
-  if (!grepl("\\.(geojson|json|gpkg)$", args$aoi, ignore.case = TRUE)) {
-    stop("--aoi must have a .geojson, .json, or .gpkg extension")
+  if (!is.null(args$aoi)) {
+    if (!file.exists(args$aoi) || dir.exists(args$aoi)) {
+      stop("--aoi must be exactly one existing GeoJSON or GeoPackage file")
+    }
+    if (!grepl("\\.(geojson|json|gpkg)$", args$aoi, ignore.case = TRUE)) {
+      stop("--aoi must have a .geojson, .json, or .gpkg extension")
+    }
   }
   if (!dir.exists(args$output_dir)) {
     stop("--output-dir must be an existing directory")
@@ -259,10 +277,17 @@ read_geojson_aoi <- function(path) {
   }
 
   roles <- tolower(trimws(as.character(features$role)))
-  unknown <- unique(roles[!roles %in% c("include", "exclude")])
+  aliases <- c(
+    include = "include",
+    inclusion = "include",
+    exclude = "exclude",
+    exclusion = "exclude"
+  )
+  unknown <- unique(roles[!roles %in% names(aliases)])
   if (length(unknown) > 0) {
     stop(sprintf("Audit AOI contains unsupported feature role(s): %s", paste(unknown, collapse = ", ")))
   }
+  roles <- unname(aliases[roles])
   list(
     inclusion = features[roles == "include", , drop = FALSE],
     exclusion = features[roles == "exclude", , drop = FALSE]
@@ -300,15 +325,71 @@ read_audit_aoi <- function(path) {
   if (length(usable) == 0 || all(st_is_empty(usable))) {
     stop("Audit AOI exclusions remove the complete inclusion geometry")
   }
-  list(inclusion = inclusion, exclusion = exclusion, usable = usable)
+  list(
+    inclusion = inclusion,
+    exclusion = exclusion,
+    usable = usable,
+    source = "audit_aoi"
+  )
 }
 
-make_grid_at <- function(geometry, tile_size, offset_x, offset_y) {
-  bounds <- st_bbox(geometry)
+read_point_cloud_extent <- function(path) {
+  header <- readLASheader(path)
+  bounds <- c(
+    xmin = as.numeric(header@PHB[["Min X"]]),
+    ymin = as.numeric(header@PHB[["Min Y"]]),
+    xmax = as.numeric(header@PHB[["Max X"]]),
+    ymax = as.numeric(header@PHB[["Max Y"]])
+  )
+  if (any(!is.finite(bounds)) ||
+      bounds[["xmax"]] <= bounds[["xmin"]] ||
+      bounds[["ymax"]] <= bounds[["ymin"]]) {
+    stop("point-cloud header does not contain a usable two-dimensional XY extent")
+  }
+
+  ring <- matrix(c(
+    bounds[["xmin"]], bounds[["ymin"]],
+    bounds[["xmax"]], bounds[["ymin"]],
+    bounds[["xmax"]], bounds[["ymax"]],
+    bounds[["xmin"]], bounds[["ymax"]],
+    bounds[["xmin"]], bounds[["ymin"]]
+  ), ncol = 2, byrow = TRUE)
+  extent <- st_sfc(st_polygon(list(ring)), crs = NA_crs_)
+  list(
+    inclusion = extent,
+    exclusion = st_sfc(crs = NA_crs_),
+    usable = extent,
+    source = "point_cloud_extent"
+  )
+}
+
+read_analysis_footprint <- function(point_cloud, aoi = NULL) {
+  if (is.null(aoi)) return(read_point_cloud_extent(point_cloud))
+  audit <- read_audit_aoi(aoi)
+  point_cloud_extent <- read_point_cloud_extent(point_cloud)
+  overlap <- suppressWarnings(st_intersection(
+    audit$usable,
+    point_cloud_extent$usable
+  ))
+  overlap_area <- if (length(overlap) == 0L) 0 else sum(as.numeric(st_area(overlap)))
+  if (!is.finite(overlap_area) || overlap_area <= 0) {
+    stop(
+      "Audit AOI does not overlap the point-cloud XY extent; ",
+      "both inputs must use the same local coordinate frame"
+    )
+  }
+  audit
+}
+
+make_grid_at <- function(geometry, tile_size, offset_x, offset_y,
+                         reference_bounds = st_bbox(geometry)) {
   st_make_grid(
     geometry,
     cellsize = tile_size,
-    offset = c(bounds[["xmin"]] - offset_x, bounds[["ymin"]] - offset_y)
+    offset = c(
+      reference_bounds[["xmin"]] - offset_x,
+      reference_bounds[["ymin"]] - offset_y
+    )
   )
 }
 
@@ -316,33 +397,64 @@ count_complete_tiles <- function(grid, geometry) {
   sum(lengths(st_within(grid, geometry)) > 0)
 }
 
-build_optimized_tiles <- function(geometry, tile_size, search_step) {
+build_optimized_tiles <- function(geometry, tile_size, search_step, threads = 1L) {
   offsets <- seq(0, tile_size - search_step, by = search_step)
-  maximum_possible_tiles <- ceiling(
+  reference_bounds <- st_bbox(geometry)
+  components <- st_cast(geometry, "POLYGON", warn = FALSE)
+  candidates <- data.frame(
+    offset_x = rep(offsets, each = length(offsets)),
+    offset_y = rep(offsets, times = length(offsets))
+  )
+  maximum_possible_tiles <- floor(
     as.numeric(st_area(geometry)) / tile_size^2
   )
-  best_count <- -1L
-  best_x <- 0
-  best_y <- 0
-  reached_upper_bound <- FALSE
-
-  for (offset_x in offsets) {
-    for (offset_y in offsets) {
-      grid <- make_grid_at(geometry, tile_size, offset_x, offset_y)
-      count <- count_complete_tiles(grid, geometry)
-      if (count > best_count) {
-        best_count <- count
-        best_x <- offset_x
-        best_y <- offset_y
-      }
-      if (best_count >= maximum_possible_tiles) {
-        reached_upper_bound <- TRUE
-        break
-      }
-    }
-    if (reached_upper_bound) break
+  count_candidate <- function(index) {
+    sum(vapply(seq_along(components), function(component_index) {
+      component <- components[component_index]
+      count_complete_tiles(
+        make_grid_at(
+          component,
+          tile_size,
+          candidates$offset_x[[index]],
+          candidates$offset_y[[index]],
+          reference_bounds
+        ),
+        component
+      )
+    }, integer(1)))
   }
 
+  first_count <- count_candidate(1L)
+  if (first_count >= maximum_possible_tiles || nrow(candidates) == 1L) {
+    best_index <- 1L
+  } else {
+    remaining <- seq.int(2L, nrow(candidates))
+    workers <- min(max(1L, as.integer(threads)), length(remaining))
+    message(sprintf(
+      "Optimizing %d remaining grid offsets with %d worker(s)",
+      length(remaining),
+      workers
+    ))
+    remaining_counts <- if (workers == 1L) {
+      vapply(remaining, count_candidate, integer(1))
+    } else {
+      unlist(
+        parallel::mclapply(
+          remaining,
+          count_candidate,
+          mc.cores = workers,
+          mc.preschedule = TRUE,
+          mc.set.seed = FALSE
+        ),
+        use.names = FALSE
+      )
+    }
+    counts <- c(first_count, remaining_counts)
+    best_index <- which.max(counts)
+  }
+
+  best_x <- candidates$offset_x[[best_index]]
+  best_y <- candidates$offset_y[[best_index]]
   grid <- make_grid_at(geometry, tile_size, best_x, best_y)
   complete <- lengths(st_within(grid, geometry)) > 0
   if (!any(complete)) {
@@ -360,6 +472,49 @@ build_optimized_tiles <- function(geometry, tile_size, search_step) {
   tiles <- tiles[order_index, , drop = FALSE]
   tiles$tile_id <- seq_len(nrow(tiles))
   tiles[, c("tile_id", "geometry")]
+}
+
+build_covering_tiles <- function(geometry, tile_size) {
+  bounds <- st_bbox(geometry)
+  span_x <- as.numeric(bounds[["xmax"]] - bounds[["xmin"]])
+  span_y <- as.numeric(bounds[["ymax"]] - bounds[["ymin"]])
+  columns <- as.integer(ceiling(span_x / tile_size))
+  rows <- as.integer(ceiling(span_y / tile_size))
+  covered_width <- columns * tile_size
+  covered_height <- rows * tile_size
+  origin_x <- as.numeric(bounds[["xmin"]] - (covered_width - span_x) / 2)
+  origin_y <- as.numeric(bounds[["ymin"]] - (covered_height - span_y) / 2)
+
+  polygons <- vector("list", columns * rows)
+  index <- 1L
+  for (row in seq_len(rows)) {
+    ymin <- origin_y + (row - 1) * tile_size
+    ymax <- ymin + tile_size
+    for (column in seq_len(columns)) {
+      xmin <- origin_x + (column - 1) * tile_size
+      xmax <- xmin + tile_size
+      ring <- matrix(c(
+        xmin, ymin,
+        xmax, ymin,
+        xmax, ymax,
+        xmin, ymax,
+        xmin, ymin
+      ), ncol = 2, byrow = TRUE)
+      polygons[[index]] <- st_polygon(list(ring))
+      index <- index + 1L
+    }
+  }
+  st_sf(
+    tile_id = seq_along(polygons),
+    geometry = st_sfc(polygons, crs = st_crs(geometry))
+  )
+}
+
+build_analysis_tiles <- function(footprint, tile_size, search_step, threads = 1L) {
+  if (identical(footprint$source, "point_cloud_extent")) {
+    return(build_covering_tiles(footprint$usable, tile_size))
+  }
+  build_optimized_tiles(footprint$usable, tile_size, search_step, threads)
 }
 
 compute_edge_flags <- function(tiles, tile_size) {
@@ -901,6 +1056,18 @@ write_layout_png <- function(aoi, tiles, edge_flags, point_cloud_name, tile_size
   png(path, width = 1600, height = 1200, res = 150)
   on.exit(dev.off(), add = TRUE)
   par(mar = c(5, 5, 5, 2) + 0.1)
+  plot_bounds <- st_bbox(aoi$inclusion)
+  if (nrow(tiles) > 0) {
+    tile_bounds <- st_bbox(tiles)
+    plot_bounds[c("xmin", "ymin")] <- pmin(
+      plot_bounds[c("xmin", "ymin")],
+      tile_bounds[c("xmin", "ymin")]
+    )
+    plot_bounds[c("xmax", "ymax")] <- pmax(
+      plot_bounds[c("xmax", "ymax")],
+      tile_bounds[c("xmax", "ymax")]
+    )
+  }
   plot(
     aoi$inclusion,
     col = adjustcolor("#2e8b57", alpha.f = 0.12),
@@ -908,6 +1075,8 @@ write_layout_png <- function(aoi, tiles, edge_flags, point_cloud_name, tile_size
     lwd = 3,
     axes = TRUE,
     asp = 1,
+    xlim = as.numeric(plot_bounds[c("xmin", "xmax")]),
+    ylim = as.numeric(plot_bounds[c("ymin", "ymax")]),
     xlab = "Point-cloud-local X",
     ylab = "Point-cloud-local Y",
     main = sprintf("%s — %d valid Analysis Tiles", point_cloud_name, nrow(tiles))
@@ -952,11 +1121,24 @@ write_layout_png <- function(aoi, tiles, edge_flags, point_cloud_name, tile_size
     lwd = 2
   )
   text(scale_x + tile_size / 2, scale_y + span_y * 0.035, sprintf("%g m", tile_size))
+  boundary_label <- if (identical(aoi$source, "point_cloud_extent")) {
+    "Point-cloud extent"
+  } else {
+    "Audit AOI"
+  }
+  legend_labels <- c(boundary_label, "Edge tile", "Interior tile")
+  legend_colors <- c("#17633b", "#f59e0b", "#2563eb")
+  legend_widths <- c(3, 2, 2)
+  if (length(aoi$exclusion) > 0) {
+    legend_labels <- append(legend_labels, "Exclusion", after = 1)
+    legend_colors <- append(legend_colors, "#991b1b", after = 1)
+    legend_widths <- append(legend_widths, 2, after = 1)
+  }
   legend(
     "bottomright",
-    legend = c("Audit AOI", "Exclusion", "Edge tile", "Interior tile"),
-    col = c("#17633b", "#991b1b", "#f59e0b", "#2563eb"),
-    lwd = c(3, 2, 2, 2),
+    legend = legend_labels,
+    col = legend_colors,
+    lwd = legend_widths,
     bg = "white"
   )
   invisible(path)
@@ -974,10 +1156,11 @@ peak_rss_mib <- function() {
   as.numeric(gsub("[^0-9]", "", line[[1]])) / 1024
 }
 
-write_performance_report <- function(parameters, point_count, tile_count,
+write_performance_report <- function(parameters, footprint_source, point_count, tile_count,
                                      instance_dimension, timings, path) {
   report <- data.table(
     point_cloud = basename(parameters$point_cloud),
+    footprint_source = footprint_source,
     point_count = point_count,
     tile_count = tile_count,
     instance_dimension = if (is.null(instance_dimension)) NA_character_ else instance_dimension,
@@ -1026,11 +1209,17 @@ main <- function() {
     message(sprintf("Using lidR default thread count: %d", get_lidr_threads()))
   }
   grid_started <- proc.time()[["elapsed"]]
-  aoi <- read_audit_aoi(parameters$aoi)
-  tiles <- build_optimized_tiles(
-    aoi$usable,
+  aoi <- read_analysis_footprint(parameters$point_cloud, parameters$aoi)
+  if (identical(aoi$source, "point_cloud_extent")) {
+    message("No Audit AOI supplied; covering the complete point-cloud XY extent")
+  } else {
+    message(sprintf("Using Audit AOI: %s", basename(parameters$aoi)))
+  }
+  tiles <- build_analysis_tiles(
+    aoi,
     parameters$tile_size,
-    parameters$grid_search_step
+    parameters$grid_search_step,
+    if (parameters$threads > 0) parameters$threads else get_lidr_threads()
   )
   grid_seconds <- elapsed_seconds(grid_started)
   message(sprintf("Optimized grid contains %d complete Analysis Tiles", nrow(tiles)))
@@ -1097,15 +1286,29 @@ main <- function() {
 
   edge_flags <- compute_edge_flags(tiles, parameters$tile_size)
   tile_started <- proc.time()[["elapsed"]]
-  rows <- lapply(seq_len(nrow(tiles)), function(index) {
+  tile_indices <- seq_len(nrow(tiles))
+  tile_thread_budget <- max(
+    1L,
+    as.integer(
+      if (parameters$threads > 0) parameters$threads else get_lidr_threads()
+    )
+  )
+  tile_plan <- tile_worker_plan(tile_thread_budget, length(tile_indices))
+  tile_workers <- tile_plan$process_workers
+  tile_threads_per_worker <- tile_plan$threads_per_worker
+  calculate_row <- function(index) {
+    if (tile_workers > 1L) {
+      set_lidr_threads(tile_threads_per_worker)
+    }
     chm_path <- file.path(
       chm_directory,
       sprintf("tile_%06d_chm.tif", tiles$tile_id[[index]])
     )
+    worker_dtm <- if (tile_workers > 1L) rast(dtm_path) else dtm
     metrics <- calculate_tile_metrics(
       parameters$point_cloud,
       tiles[index, ],
-      dtm,
+      worker_dtm,
       parameters,
       chm_path
     )
@@ -1116,12 +1319,15 @@ main <- function() {
       metrics,
       tree_metrics_for_tile(segments, tiles$tile_id[[index]])
     )
-  })
-  result <- if (length(rows)) {
-    rbindlist(rows, use.names = TRUE, fill = TRUE)
-  } else {
-    empty_result_table()
   }
+  if (length(tile_indices) > 0L) {
+    message(sprintf(
+      "Calculating %d tile metric rows sequentially with %d lidR thread(s)",
+      length(tile_indices),
+      tile_threads_per_worker
+    ))
+  }
+  result <- collect_tile_rows(tile_indices, calculate_row, tile_workers)
   tile_seconds <- elapsed_seconds(tile_started)
 
   output_started <- proc.time()[["elapsed"]]
@@ -1146,6 +1352,7 @@ main <- function() {
     point_count <- readLASheader(parameters$point_cloud)@PHB[["Number of point records"]]
     write_performance_report(
       parameters,
+      aoi$source,
       point_count,
       nrow(tiles),
       instance_dimension,
@@ -1163,10 +1370,12 @@ main <- function() {
   message(sprintf("Wrote %d Analysis Tile rows to %s", nrow(result), output_path))
 }
 
-tryCatch(
-  main(),
-  error = function(error) {
-    message("forest-structure analysis failed: ", conditionMessage(error))
-    quit(status = 1)
-  }
-)
+if (!identical(Sys.getenv("FORESTSTRUCTURE_SOURCE_ONLY"), "1")) {
+  tryCatch(
+    main(),
+    error = function(error) {
+      message("forest-structure analysis failed: ", conditionMessage(error))
+      quit(status = 1)
+    }
+  )
+}

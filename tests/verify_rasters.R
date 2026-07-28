@@ -8,7 +8,7 @@ case_directories <- list.dirs(results_dir, recursive = FALSE, full.names = TRUE)
 case_directories <- case_directories[
   !startsWith(basename(case_directories), "failure_")
 ]
-if (length(case_directories) != 6) stop("unexpected number of acceptance cases")
+if (length(case_directories) != 7) stop("unexpected number of acceptance cases")
 
 for (output_dir in case_directories) {
   csv <- read.csv(file.path(output_dir, "forest_structure_tiles.csv"), na.strings = "NA")
