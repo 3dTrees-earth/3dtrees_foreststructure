@@ -1,6 +1,7 @@
 suppressPackageStartupMessages({
   library(argparse)
   library(data.table)
+  library(future)
   library(lidR)
   library(sf)
   library(terra)
@@ -101,10 +102,16 @@ parse_parameters <- function() {
     help = "CHM gap-height threshold in metres (default: 3)"
   )
   runtime$add_argument(
+    "--dtm-chunk-size", "--dtm_chunk_size",
+    type = "double",
+    default = 200,
+    help = "LAScatalog DTM chunk width in metres (default: 200)"
+  )
+  runtime$add_argument(
     "--chunk-size", "--chunk_size",
     type = "double",
     default = 60,
-    help = "LAScatalog streaming chunk width in metres (default: 60)"
+    help = "LAScatalog global-segment chunk width in metres (default: 60)"
   )
   runtime$add_argument(
     "--dtm-buffer", "--dtm_buffer",
@@ -211,8 +218,8 @@ parse_parameters <- function() {
 
   positive <- c(
     "tile_size", "grid_search_step", "ptd_resolution", "dtm_resolution",
-    "maximum_height", "voxel_resolution", "chm_resolution", "chunk_size",
-    "dtm_buffer"
+    "maximum_height", "voxel_resolution", "chm_resolution", "dtm_chunk_size",
+    "chunk_size", "dtm_buffer"
   )
   for (name in positive) {
     if (!is.finite(args[[name]]) || args[[name]] <= 0) {
@@ -537,26 +544,51 @@ compute_edge_flags <- function(tiles, tile_size) {
 }
 
 dtm_chunk <- function(chunk, dtm_resolution, ptd_resolution) {
+  lidR::set_lidr_threads(1L)
   las <- readLAS(chunk)
   if (is.empty(las)) return(NULL)
   las <- classify_ground(las, ptd(res = ptd_resolution))
   rasterize_terrain(las, res = dtm_resolution, algorithm = tin())
 }
 
+with_catalog_workers <- function(workers, phase, expression) {
+  workers <- max(1L, as.integer(workers))
+  previous_lidr_threads <- lidR::get_lidr_threads()
+  on.exit(
+    lidR::set_lidr_threads(previous_lidr_threads),
+    add = TRUE
+  )
+  message(sprintf(
+    "Processing %s LAScatalog chunks with %d worker(s)",
+    phase,
+    workers
+  ))
+  if (workers == 1L) return(force(expression))
+
+  previous_plan <- future::plan()
+  on.exit(future::plan(previous_plan), add = TRUE)
+  future::plan(future::multisession, workers = workers)
+  force(expression)
+}
+
 build_global_dtm <- function(point_cloud, chunk_size, dtm_buffer,
-                             dtm_resolution, ptd_resolution) {
+                             dtm_resolution, ptd_resolution, workers) {
   catalog <- readLAScatalog(point_cloud)
   opt_chunk_size(catalog) <- chunk_size
   opt_chunk_buffer(catalog) <- dtm_buffer
   opt_select(catalog) <- "xyz"
   opt_progress(catalog) <- FALSE
 
-  result <- catalog_apply(
-    catalog,
-    dtm_chunk,
-    dtm_resolution = dtm_resolution,
-    ptd_resolution = ptd_resolution,
-    .options = list(automerge = TRUE, raster_alignment = dtm_resolution)
+  result <- with_catalog_workers(
+    workers,
+    "DTM",
+    catalog_apply(
+      catalog,
+      dtm_chunk,
+      dtm_resolution = dtm_resolution,
+      ptd_resolution = ptd_resolution,
+      .options = list(automerge = TRUE, raster_alignment = dtm_resolution)
+    )
   )
   if (inherits(result, "list")) {
     result <- Filter(Negate(is.null), result)
@@ -582,10 +614,12 @@ select_instance_dimension <- function(point_cloud, candidates) {
   selected[[1]]
 }
 
-segment_chunk <- function(chunk, dtm, voxel_resolution, maximum_height,
+segment_chunk <- function(chunk, dtm_path, voxel_resolution, maximum_height,
                           instance_dimension) {
+  lidR::set_lidr_threads(1L)
   las <- readLAS(chunk)
   if (is.empty(las) || !instance_dimension %in% names(las@data)) return(NULL)
+  dtm <- terra::rast(dtm_path)
   las <- normalize_height(las, dtm)
   source <- as.data.table(las@data)
   source[, instance_id := get(instance_dimension)]
@@ -611,9 +645,9 @@ segment_chunk <- function(chunk, dtm, voxel_resolution, maximum_height,
   )
 }
 
-accumulate_segments <- function(point_cloud, dtm, chunk_size,
+accumulate_segments <- function(point_cloud, dtm_path, chunk_size,
                                 voxel_resolution, maximum_height,
-                                instance_dimension) {
+                                instance_dimension, workers) {
   catalog <- readLAScatalog(point_cloud)
   opt_chunk_size(catalog) <- chunk_size
   opt_chunk_buffer(catalog) <- 0
@@ -625,14 +659,18 @@ accumulate_segments <- function(point_cloud, dtm, chunk_size,
     "*"
   }
   opt_progress(catalog) <- FALSE
-  chunks <- catalog_apply(
-    catalog,
-    segment_chunk,
-    dtm = dtm,
-    voxel_resolution = voxel_resolution,
-    maximum_height = maximum_height,
-    instance_dimension = instance_dimension,
-    .options = list(automerge = FALSE)
+  chunks <- with_catalog_workers(
+    workers,
+    "segment",
+    catalog_apply(
+      catalog,
+      segment_chunk,
+      dtm_path = dtm_path,
+      voxel_resolution = voxel_resolution,
+      maximum_height = maximum_height,
+      instance_dimension = instance_dimension,
+      .options = list(automerge = FALSE)
+    )
   )
   chunks <- Filter(Negate(is.null), chunks)
   if (length(chunks) == 0) return(NULL)
@@ -1166,6 +1204,7 @@ write_performance_report <- function(parameters, footprint_source, point_count, 
     instance_dimension = if (is.null(instance_dimension)) NA_character_ else instance_dimension,
     threads_requested = parameters$threads,
     threads_effective = get_lidr_threads(),
+    catalog_workers = get_lidr_threads(),
     peak_rss_mib = round(peak_rss_mib(), 3),
     grid_seconds = round(timings$grid, 6),
     dtm_seconds = round(timings$dtm, 6),
@@ -1186,6 +1225,7 @@ write_performance_report <- function(parameters, footprint_source, point_count, 
     apex_minimum_height = parameters$apex_minimum_height,
     minimum_tree_thickness = parameters$minimum_tree_thickness,
     minimum_occupied_layers = parameters$minimum_occupied_layers,
+    dtm_chunk_size = parameters$dtm_chunk_size,
     chunk_size = parameters$chunk_size,
     dtm_buffer = parameters$dtm_buffer,
     instance_dimension_candidates = paste(parameters$instance_dimension, collapse = "|")
@@ -1208,6 +1248,12 @@ main <- function() {
   } else {
     message(sprintf("Using lidR default thread count: %d", get_lidr_threads()))
   }
+  thread_budget <- max(
+    1L,
+    as.integer(
+      if (parameters$threads > 0) parameters$threads else get_lidr_threads()
+    )
+  )
   grid_started <- proc.time()[["elapsed"]]
   aoi <- read_analysis_footprint(parameters$point_cloud, parameters$aoi)
   if (identical(aoi$source, "point_cloud_extent")) {
@@ -1219,7 +1265,7 @@ main <- function() {
     aoi,
     parameters$tile_size,
     parameters$grid_search_step,
-    if (parameters$threads > 0) parameters$threads else get_lidr_threads()
+    thread_budget
   )
   grid_seconds <- elapsed_seconds(grid_started)
   message(sprintf("Optimized grid contains %d complete Analysis Tiles", nrow(tiles)))
@@ -1227,10 +1273,11 @@ main <- function() {
   dtm_started <- proc.time()[["elapsed"]]
   dtm <- build_global_dtm(
     parameters$point_cloud,
-    parameters$chunk_size,
+    parameters$dtm_chunk_size,
     parameters$dtm_buffer,
     parameters$dtm_resolution,
-    parameters$ptd_resolution
+    parameters$ptd_resolution,
+    thread_budget
   )
   if (is.null(dtm)) stop("global DTM generation produced no raster")
   dtm_path <- file.path(parameters$output_dir, "forest_structure_dtm.tif")
@@ -1249,11 +1296,12 @@ main <- function() {
     message(sprintf("Using Instance Dimension: %s", instance_dimension))
     accumulated <- accumulate_segments(
       parameters$point_cloud,
-      dtm,
+      dtm_path,
       parameters$chunk_size,
       parameters$voxel_resolution,
       parameters$maximum_height,
-      instance_dimension
+      instance_dimension,
+      thread_budget
     )
     if (!is.null(accumulated)) {
       segments <- assign_segments_to_tiles(
@@ -1287,13 +1335,7 @@ main <- function() {
   edge_flags <- compute_edge_flags(tiles, parameters$tile_size)
   tile_started <- proc.time()[["elapsed"]]
   tile_indices <- seq_len(nrow(tiles))
-  tile_thread_budget <- max(
-    1L,
-    as.integer(
-      if (parameters$threads > 0) parameters$threads else get_lidr_threads()
-    )
-  )
-  tile_plan <- tile_worker_plan(tile_thread_budget, length(tile_indices))
+  tile_plan <- tile_worker_plan(thread_budget, length(tile_indices))
   tile_workers <- tile_plan$process_workers
   tile_threads_per_worker <- tile_plan$threads_per_worker
   calculate_row <- function(index) {

@@ -30,6 +30,10 @@ completely inside the inclusion geometry and may not overlap exclusions.
 docker build -t 3dtrees-foreststructure:local .
 ```
 
+The image pins the complete `lidR` 4.3.2 source archive and verifies its
+SHA-256 digest during the build. This keeps the PTD implementation
+reproducible even while `lidR` is absent from the current CRAN package index.
+
 ## Run
 
 ```bash
@@ -47,6 +51,11 @@ The tool always optimizes the fixed-size grid placement within the usable AOI.
 Its grid-search resolution is configurable with `--grid-search-step` and
 defaults to 0.5 m. Run the image with `--help` to inspect all available
 scientific and runtime parameters and their defaults.
+
+The thread budget is applied automatically to every phase. Grid placement uses
+forked workers, buffered DTM and segment catalog chunks use `future`
+multisession workers, and each catalog worker uses one lidR thread to avoid
+nested oversubscription. Tile metrics retain the full lidR thread budget.
 
 To cover the complete point cloud without an Audit AOI, omit `--aoi`:
 
@@ -98,7 +107,8 @@ placement:
 
 | Option | Default | Meaning |
 | --- | ---: | --- |
-| `--chunk-size` | 60 m | LAScatalog streaming chunk width |
+| `--dtm-chunk-size` | 200 m | LAScatalog DTM chunk width |
+| `--chunk-size` | 60 m | LAScatalog global-segment chunk width |
 | `--dtm-buffer` | 20 m | PTD/TIN chunk-edge buffer |
 | `--threads` | 0 | Preserve lidR's container default; positive values set an explicit count |
 | `--instance-dimension` | common aliases | Repeatable ordered extra-byte candidate |

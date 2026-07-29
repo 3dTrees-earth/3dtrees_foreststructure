@@ -12,6 +12,34 @@ docker build --tag "${image_name}" "${repo_dir}"
 docker run --rm --network none \
   "${docker_limits[@]}" \
   --entrypoint Rscript \
+  "${image_name}" \
+  -e '
+    stopifnot(requireNamespace("geometry", quietly = TRUE))
+    stopifnot(requireNamespace("future", quietly = TRUE))
+    stopifnot(packageVersion("lidR") == "4.3.2")
+    stopifnot("ptd" %in% getNamespaceExports("lidR"))
+    Sys.setenv(FORESTSTRUCTURE_SOURCE_ONLY = "1")
+    setwd("/opt/foreststructure")
+    source("run.R")
+    original_workers <- future::nbrOfWorkers()
+    original_lidr_threads <- lidR::get_lidr_threads()
+    lidR::set_lidr_threads(2L)
+    configured_workers <- with_catalog_workers(
+      2L,
+      "smoke-test",
+      {
+        lidR::set_lidr_threads(1L)
+        future::nbrOfWorkers()
+      }
+    )
+    stopifnot(configured_workers == 2L)
+    stopifnot(future::nbrOfWorkers() == original_workers)
+    stopifnot(lidR::get_lidr_threads() == 2L)
+    lidR::set_lidr_threads(original_lidr_threads)
+  '
+docker run --rm --network none \
+  "${docker_limits[@]}" \
+  --entrypoint Rscript \
   --volume "${repo_dir}:/workspace:ro" \
   --workdir /workspace \
   "${image_name}" \
@@ -40,6 +68,8 @@ for expected_help in \
   "default: 20" \
   "--grid-search-step" \
   "default: 0.5" \
+  "--dtm-chunk-size" \
+  "default: 200" \
   "--instance-dimension" \
   "--segment-diagnostics"; do
   grep -q -- "${expected_help}" "${help_path}"
@@ -245,12 +275,21 @@ if expect_performance:
     required_performance = {
         "footprint_source", "point_count", "tile_count", "peak_rss_mib", "grid_seconds",
         "dtm_seconds", "segment_seconds", "tile_seconds", "output_seconds",
-        "total_seconds", "threads_requested", "threads_effective",
+        "total_seconds", "threads_requested", "threads_effective", "catalog_workers",
+        "dtm_chunk_size", "chunk_size", "dtm_buffer",
     }
     if required_performance.difference(performance_rows[0]):
         raise SystemExit("performance report is missing required measurements")
     if performance_rows[0]["footprint_source"] != expected_footprint_source:
         raise SystemExit("performance report has the wrong footprint source")
+    if performance_rows[0]["dtm_chunk_size"] != "200":
+        raise SystemExit("performance report has the wrong default DTM chunk size")
+    if performance_rows[0]["chunk_size"] != "60":
+        raise SystemExit("performance report has the wrong default segment chunk size")
+    if performance_rows[0]["dtm_buffer"] != "20":
+        raise SystemExit("performance report has the wrong default DTM buffer")
+    if performance_rows[0]["catalog_workers"] != performance_rows[0]["threads_effective"]:
+        raise SystemExit("performance report has the wrong catalog worker count")
 
 if not geojson_path.is_file():
     raise SystemExit(f"missing tile GeoJSON: {geojson_path}")
