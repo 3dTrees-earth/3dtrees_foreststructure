@@ -20,9 +20,9 @@ RUN install2.r --error --skipinstalled \
     sf \
     stars \
     terra \
-    && curl -fsSL \
+    && wget --quiet \
       "https://cran.r-project.org/src/contrib/Archive/lidR/lidR_${LIDR_VERSION}.tar.gz" \
-      -o /tmp/lidR.tar.gz \
+      -O /tmp/lidR.tar.gz \
     && printf '%s  %s\n' "${LIDR_SHA256}" /tmp/lidR.tar.gz \
       | sha256sum --check --strict \
     && R CMD INSTALL /tmp/lidR.tar.gz \
