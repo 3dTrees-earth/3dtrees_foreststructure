@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       source_ref:
-        description: Git ref whose source should be tested and published
+        description: Historical Git ref to publish after verifying runtime-source equivalence
         required: false
         default: ""
       release_tag:
@@ -32,7 +32,11 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.source_ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Verify historical runtime source
+        if: ${{ inputs.source_ref != '' }}
+        run: git diff --exit-code "${{ inputs.source_ref }}" -- Dockerfile Makefile src
 
       - name: Run container acceptance suite
         run: make test
