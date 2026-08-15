@@ -53,9 +53,21 @@ jobs:
 
       - name: Resolve source revision
         id: source
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "short_sha=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+          source_sha="$(git rev-parse HEAD)"
+          short_sha="$(git rev-parse --short=7 HEAD)"
+          if [[ -n "$RELEASE_TAG" ]]; then
+            image_version="$RELEASE_TAG"
+          elif [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            image_version="$GITHUB_REF_NAME"
+          else
+            image_version="sha-$short_sha"
+          fi
+          echo "sha=$source_sha" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$short_sha" >> "$GITHUB_OUTPUT"
+          echo "image_version=$image_version" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -84,10 +96,13 @@ jobs:
           context: .
           push: true
           tags: ${{ steps.metadata.outputs.tags }}
-          labels: ${{ steps.metadata.outputs.labels }}
+          labels: |
+            ${{ steps.metadata.outputs.labels }}
+            org.opencontainers.image.revision=${{ steps.source.outputs.sha }}
+            org.opencontainers.image.version=${{ steps.source.outputs.image_version }}
           build-args: |
             VCS_REF=${{ steps.source.outputs.sha }}
-            IMAGE_VERSION=${{ steps.metadata.outputs.version }}
+            IMAGE_VERSION=${{ steps.source.outputs.image_version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: mode=max
