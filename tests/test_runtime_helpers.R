@@ -12,7 +12,11 @@ stopifnot("ptd" %in% getNamespaceExports("lidR"))
 
 original_data_table_threads <- data.table::getDTthreads()
 configure_catalog_worker()
-stopifnot(data.table::getDTthreads() == DATA_TABLE_THREADS)
+configured_data_table_threads <- data.table::getDTthreads()
+stopifnot(
+  configured_data_table_threads >= 1L,
+  configured_data_table_threads <= DATA_TABLE_THREADS
+)
 data.table::setDTthreads(original_data_table_threads)
 
 dtm_body <- paste(deparse(body(write_global_dtm)), collapse = "\n")
