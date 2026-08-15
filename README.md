@@ -34,6 +34,17 @@ The image pins the complete `lidR` 4.3.2 source archive and verifies its
 SHA-256 digest during the build. This keeps the PTD implementation
 reproducible even while `lidR` is absent from the current CRAN package index.
 
+Published releases are available from the GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/3dtrees-earth/3dtrees-foreststructure:v0.1.0
+```
+
+Use a version tag for reproducible work. `latest` follows `main`, while
+`sha-<commit>` identifies the image built from one exact Git commit. The
+publishing workflow runs the complete synthetic acceptance suite before it
+pushes an image.
+
 ## Run
 
 ```bash
@@ -44,6 +55,7 @@ docker run --rm --network none \
   3dtrees-foreststructure:local \
   --point-cloud /in/point_cloud.laz \
   --aoi /in/aoi.geojson \
+  --dataset-id 150 \
   --output-dir /out
 ```
 
@@ -53,9 +65,14 @@ defaults to 0.5 m. Run the image with `--help` to inspect all available
 scientific and runtime parameters and their defaults.
 
 The thread budget is applied automatically to every phase. Grid placement uses
-forked workers, buffered DTM and segment catalog chunks use `future`
-multisession workers, and each catalog worker uses one lidR thread to avoid
-nested oversubscription. Tile metrics retain the full lidR thread budget.
+forked workers and tile metrics retain the full lidR thread budget. Buffered
+DTM, CHM, and segment catalog chunks use `future` multisession workers, capped
+separately by `--catalog-workers` (2 by default), and each catalog worker uses
+one lidR thread. Keeping process concurrency below the CPU allowance prevents
+dense COPC chunks from collectively exhausting the container memory limit.
+Segment workers additionally cap `data.table` at five threads; DTM, CHM, and
+tile-metric thread behavior is unchanged so scientific raster and tile values
+remain reproducible.
 
 To cover the complete point cloud without an Audit AOI, omit `--aoi`:
 
@@ -65,22 +82,57 @@ docker run --rm --network none \
   -v "$PWD/output:/out" \
   3dtrees-foreststructure:local \
   --point-cloud /in/point_cloud.laz \
+  --dataset-id 150 \
   --output-dir /out
 ```
 
-Tree metrics are optional. Repeat `--instance-dimension` to provide candidate
-extra-byte names in priority order (comma-separated names are also accepted).
-The first name present in the LAS/LAZ header is used for one global segment
-pass; the defaults are `PredInstance`, `PredInstance_SAT`, `PredInstance_FM`,
-and `treeID`. If none exists, the run still succeeds and every tree/segment
-field in the tile CSV is `NA`. Trees are aggregated globally and assigned to
-exactly one tile by their apex, including trees spanning tile boundaries.
+Tree metrics are optional. Repeat `--instance-dimension` to provide extra-byte
+names to process (comma-separated names are also accepted). Every requested
+name present in the LAS/LAZ header is processed in one global segment pass;
+missing names are skipped. The defaults are `PredInstance`,
+`PredInstance_SAT`, and `PredInstance_FM`. Each available dimension gets its
+own tile and segment CSV so IDs and metrics from different segmentations never
+mix. If none exists, the run still succeeds and writes a header-only fallback
+segment CSV; every tree/segment field in the fallback tile CSV is `NA`. Trees
+are aggregated globally within each dimension and assigned to exactly one tile
+by their apex, including trees spanning tile boundaries.
 
-Use `--segment-diagnostics` to additionally write
-`segment_diagnostics.csv`. It is omitted by default. Tree filtering defaults
-to at least 100 occupied 0.2 m voxels, an apex above 3 m, a minimum 0.5 m PCA
-thickness, and at least three occupied 1 m height layers; each threshold is a
-CLI parameter.
+The global segment pass reads XYZ plus only the selected ExtraBytes positions.
+When a requested dimension occurs beyond lidR's individually selectable first
+nine ExtraBytes fields, it falls back to XYZ plus all ExtraBytes, never the
+all-attribute wildcard. Per-chunk voxel, layer, and apex summaries are written
+to temporary uncompressed RDS files partitioned into 64 deterministic
+instance-ID buckets. The parent finalizes one bucket at a time and deletes the
+temporary store on success or failure. This preserves global tree metrics and
+output ordering while preventing all chunk summaries and their concatenated
+copies from occupying memory simultaneously. Chunks with multiple available
+instance dimensions also build and spill those dimension summaries
+sequentially, so SAT/FM alternatives do not multiply the chunk's peak memory.
+
+Every DTM, CHM, and segment catalog chunk must complete. Empty or geometrically
+degenerate raster chunks contribute aligned no-data rasters; worker errors are
+reported as failures instead of allowing partial scientific outputs. Raster
+extent checks tolerate only coordinate-scale floating-point noise at an
+otherwise identical grid boundary.
+
+R/lidR cannot represent a single LAS/LAZ/COPC file containing more than
+2,147,483,647 points. Such inputs stop during binary-header preflight with the
+machine-readable flag `unsupported_lidr_point_count` and must be split before
+ForestStructure processing.
+
+The dataset ID is a required positive integer and prefixes every artifact.
+For each available dimension, both
+`<dataset-id>_<instance-dimension>_results.csv` and
+`<dataset-id>_<instance-dimension>_segment_diagnostics.csv` are written with
+the supplied upstream schemas. Their `file` column is the input basename;
+`sensor` and `country` are `NA` until workflow metadata is connected. With no
+available dimension, the fallback names are `<dataset-id>_results.csv` and
+`<dataset-id>_segment_diagnostics.csv`. The legacy `--segment-diagnostics`
+flag remains accepted as a deprecated no-op.
+
+Tree filtering defaults to at least 100 occupied 0.2 m voxels, an apex above
+3 m, a minimum 0.5 m PCA thickness, and at least three occupied 1 m height
+layers; each threshold is a CLI parameter.
 
 ## Parameters
 
@@ -95,7 +147,7 @@ Scientific controls retain the supplied R script's defaults:
 | `--maximum-height` | 70 m | Upper normalized-height cutoff |
 | `--voxel-resolution` | 0.2 m | Structural voxel edge length |
 | `--vegetation-minimum-height` | 0.5 m | Lower vegetation cutoff |
-| `--chm-resolution` | 0.5 m | Per-tile canopy-height raster resolution |
+| `--chm-resolution` | 0.5 m | Full-point-cloud canopy-height raster resolution |
 | `--gap-height-threshold` | 3 m | Canopy-gap threshold |
 | `--minimum-tree-voxels` | 100 | Minimum occupied voxels per accepted tree |
 | `--apex-minimum-height` | 3 m | Strict lower apex-height threshold |
@@ -107,28 +159,74 @@ placement:
 
 | Option | Default | Meaning |
 | --- | ---: | --- |
-| `--dtm-chunk-size` | 200 m | LAScatalog DTM chunk width |
+| `--dtm-chunk-size` | 60 m | LAScatalog DTM chunk width |
 | `--chunk-size` | 60 m | LAScatalog global-segment chunk width |
 | `--dtm-buffer` | 20 m | PTD/TIN chunk-edge buffer |
 | `--threads` | 0 | Preserve lidR's container default; positive values set an explicit count |
-| `--instance-dimension` | common aliases | Repeatable ordered extra-byte candidate |
-| `--segment-diagnostics` | off | Emit the optional global segment CSV |
+| `--catalog-workers` | 2 | Memory-bounded LAScatalog process cap; limited further by `--threads` |
+| `--instance-dimension` | common aliases | Repeatable extra-byte dimension; missing dimensions are skipped |
+| `--segment-diagnostics` | deprecated | Accepted for compatibility; the segment CSV is always emitted |
 | `--performance-report` | off | Emit phase timings, peak RSS, counts, threads, and parameters |
 
 Each invocation writes:
 
-- `forest_structure_tiles.csv`: one deterministic row per valid Analysis Tile;
-- `forest_structure_tiles.geojson`: the machine-readable tile footprints and
-  their IDs/metrics, so downstream consumers can spatially join CSV results;
-- `forest_structure_tiles.png`: a human-readable overview of the Audit AOI or
+- `<dataset-id>_<instance-dimension>_results.csv`: one deterministic row per
+  valid Analysis Tile for each available instance dimension;
+- `<dataset-id>_<instance-dimension>_segment_diagnostics.csv`: one row per
+  global segment for that dimension;
+- `<dataset-id>_<instance-dimension>_tiles.geojson`: the machine-readable tile
+  footprints and dimension-specific metrics;
+- fallback CSV/GeoJSON names without an instance-dimension suffix when no
+  configured dimension exists;
+- `<dataset-id>_tiles.png`: a human-readable overview of the Audit AOI or
   point-cloud extent, exclusions when applicable, numbered tiles, north arrow,
   and scale;
-- `forest_structure_dtm.tif`: the full-point-cloud terrain model; and
-- `chm/tile_<tile-id>_chm.tif`: one canopy-height raster per valid tile.
+- `<dataset-id>_dtm.tif`: the full-point-cloud terrain model; and
+- `<dataset-id>_chm.tif`: one canopy-height raster for the complete point
+  cloud, independent of the Audit AOI.
+
+The complete DTM and CHM are never materialized as one in-memory R raster.
+LAScatalog workers write bounded chunk rasters, the DTM overlap mosaic is
+evaluated disk-to-disk, and VRTs are streamed into tiled, compressed GeoTIFFs.
+Per-tile CHMs exist only transiently in memory while reproducing the upstream
+rumple, gap-fraction, standard-deviation, and coefficient-of-variation
+calculations; they are not exported.
 
 If no complete tile fits, the run still succeeds: the CSV contains headers,
 the GeoJSON is an empty FeatureCollection, the PNG explains that zero tiles
-were valid, the DTM is returned, and the CHM directory is empty.
+were valid, both global rasters are returned, and the segment CSV follows the
+normal global-segment behavior.
+
+## Processing design and upstream compatibility
+
+The implementation intentionally preserves the calculations, thresholds,
+column names, rounding, and deterministic row ordering of the supplied
+upstream R script. The production wrapper adds audit-aware tiling, bounded
+LAScatalog processing, multiple instance dimensions, explicit artifacts, and
+failure checks around that scientific core.
+
+One run executes these stages in order:
+
+1. Validate the CLI, LAS/LAZ header, point-count limit, and optional Audit AOI.
+2. Build the deterministic 20 m Analysis Tile grid.
+3. Produce disk-backed global DTM and CHM rasters from bounded catalog chunks.
+4. Read only XYZ, return fields, and required ExtraBytes for segmentation;
+   spill deterministic segment summaries to temporary bucket files.
+5. Finalize each instance dimension and assign each segment to one tile by its
+   apex.
+6. Calculate the upstream tile metrics and publish dimension-specific CSV and
+   GeoJSON products plus the PNG and rasters.
+
+`ReturnNumber` and `NumberOfReturns` are retained in the DTM and segmentation
+catalog selections because lidR may require them while decoding or processing
+source data. They are not exported as result columns. Missing configured
+instance dimensions are skipped and do not fail a dataset.
+
+The main known limit is dense DTM construction: pathological inputs can still
+exceed available memory inside lidR/terra even with two catalog workers. Such
+runs fail explicitly; the tool never accepts partial catalog output. Inputs
+above 2,147,483,647 points are rejected during preflight because R/lidR cannot
+represent their point count safely.
 
 ## Test
 
@@ -142,10 +240,39 @@ contract:
 make test
 ```
 
+The supplied dataset-150 upstream CSVs are retained as a strict parity oracle
+for the original `80.laz`. The audit rejects any other point cloud, including
+a COPC, and compares all 146 tiles and 397 segments with zero tolerance:
+
+```bash
+DATASET150_LAZ=/path/to/80.laz \
+  make test-dataset150
+```
+
+This audit is deliberately stricter than the production validator and is not
+part of the release-publishing workflow because the source LAZ is not public.
+The v0.1.0 implementation preserves the row counts but does **not** pass exact
+value parity: the memory-safe DTM path rescales in-memory XY coordinates from
+0.00025 m to 0.01 m where lidR's TIN integer representation requires it. On
+the validated image this changes 23 tile fields and 10 segment fields in at
+least one row; for example, tile 1 `zsd` is 0.2031 instead of 0.2057. Treat
+this as an explicitly flagged scientific deviation, not an exact reproduction
+of the upstream R output.
+
+Validated dataset outputs can also be checked byte-for-byte, excluding only the
+runtime performance report and validation metadata:
+
+```bash
+python tests/compare_validated_outputs.py \
+  150 /path/to/validated/foreststructure /path/to/candidate/output
+```
+
 ## Status
 
-The stable container and measured performance slice are complete. The Galaxy
-wrapper remains the intentionally later integration slice.
+The production artifact contract and operational validation are complete. The
+dataset-150 exact-value deviation above remains open and is intentionally
+flagged rather than hidden or automatically corrected. The Galaxy wrapper
+remains a later integration slice.
 
 ## Performance
 

@@ -14,6 +14,11 @@ ground <- expand.grid(
   X = seq(306675, 306725, by = 1),
   Y = seq(5094475, 5094525, by = 1)
 )
+edge_ground <- data.frame(
+  X = c(306674.41, 306674.61, 306674.41),
+  Y = c(5094474.41, 5094474.41, 5094474.61)
+)
+ground <- rbind(edge_ground, ground)
 ground$Z <- 178 + (ground$X - 306675) * 0.015 +
   (ground$Y - 5094475) * 0.01
 
@@ -67,10 +72,18 @@ pred_instance <- c(
   rep.int(0L, ground_count),
   ifelse(canopy$Y < 5094500, 101L, 202L)
 )
+pred_instance_sat <- c(
+  rep.int(0L, ground_count),
+  rep.int(303L, canopy_count)
+)
 tree_alias <- c(rep.int(0L, ground_count), rep.int(303L, canopy_count))
 write_fixture(
   arguments[[2]],
-  list(PredInstance = pred_instance, TreeAlias = tree_alias)
+  list(
+    PredInstance = pred_instance,
+    PredInstance_SAT = pred_instance_sat,
+    TreeAlias = tree_alias
+  )
 )
 
 ring <- function(xmin, ymin, xmax, ymax) {

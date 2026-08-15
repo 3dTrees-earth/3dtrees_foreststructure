@@ -1,0 +1,75 @@
+stopifnot(segment_selection_from_names(
+  c(paste0("extra_", 1:9), "PredInstance"),
+  "PredInstance"
+) == "xyzrn0")
+
+stopifnot(identical(SEGMENT_CATALOG_BASE_SELECTION, "xyzrn"))
+stopifnot(segment_selection_from_names(
+  c("PredInstance", "unrelated"),
+  "PredInstance"
+) == "xyzrn1")
+stopifnot(segment_selection_from_names(
+  c("unrelated"),
+  "PredInstance"
+) == "xyzrn")
+
+stopifnot(identical(DTM_CATALOG_SELECTION, "xyzrn"))
+dtm_body <- paste(deparse(body(write_global_dtm)), collapse = "\n")
+stopifnot(grepl(
+  "opt_select(catalog) <- DTM_CATALOG_SELECTION",
+  dtm_body,
+  fixed = TRUE
+))
+
+segment_body <- paste(deparse(body(segment_chunk)), collapse = "\n")
+stopifnot(grepl("lapply(selected", segment_body, fixed = TRUE))
+stopifnot(!grepl("rbindlist(lapply(selected", segment_body, fixed = TRUE))
+
+point_bounds <- c(
+  xmin = -1.1641532182693481e-10,
+  ymin = 4294967.296,
+  xmax = 999.9989999999525,
+  ymax = 4295967.2949999999
+)
+covering_extent <- terra::ext(0, 1000, 4294967, 4295968)
+stopifnot(raster_extent_covers_point_bounds(
+  covering_extent,
+  point_bounds,
+  1
+))
+stopifnot(!raster_extent_covers_point_bounds(
+  terra::ext(0.01, 1000, 4294967, 4295968),
+  point_bounds,
+  1
+))
+
+stopifnot(assert_lidr_point_count_supported(MAX_LIDR_POINT_COUNT) ==
+  MAX_LIDR_POINT_COUNT)
+unsupported <- tryCatch(
+  {
+    assert_lidr_point_count_supported(MAX_LIDR_POINT_COUNT + 1)
+    FALSE
+  },
+  error = function(error) grepl(
+    "FORESTSTRUCTURE_FLAG unsupported_lidr_point_count",
+    conditionMessage(error),
+    fixed = TRUE
+  )
+)
+stopifnot(unsupported)
+
+complete <- list("one", "two")
+stopifnot(identical(assert_catalog_completed(complete, "test"), complete))
+incomplete <- tryCatch(
+  {
+    assert_catalog_completed(list("one", NULL), "test")
+    FALSE
+  },
+  error = function(error) grepl("incomplete chunks", conditionMessage(error))
+)
+stopifnot(incomplete)
+
+collapsed <- c(xmin = 10, ymin = 20, xmax = 10, ymax = 20)
+collapsed <- ensure_nonempty_grid_bounds(collapsed, 1)
+stopifnot(collapsed[["xmax"]] > collapsed[["xmin"]])
+stopifnot(collapsed[["ymax"]] > collapsed[["ymin"]])

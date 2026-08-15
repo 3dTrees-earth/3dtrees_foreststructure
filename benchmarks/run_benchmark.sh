@@ -9,6 +9,7 @@ fi
 image_name="$1"
 work_dir="$2"
 threads="${3:-1}"
+dataset_id="999999"
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fixture_dir="${work_dir}/fixtures"
 image_slug="${image_name//[\/:]/_}_threads${threads}"
@@ -46,13 +47,14 @@ run_case() {
     "${image_name}" \
     --point-cloud "/in/${name}.laz" \
     --aoi "/in/${name}.geojson" \
+    --dataset-id "${dataset_id}" \
     --output-dir /out \
     --threads "${threads}" \
     --instance-dimension PredInstance \
     --segment-diagnostics \
     --performance-report \
     2>&1 | tee "${output_dir}/container.log"
-  sed -n '1,2p' "${output_dir}/forest_structure_performance.csv"
+  sed -n '1,2p' "${output_dir}/${dataset_id}_performance.csv"
 }
 
 prepare_fixture small 50000 60
