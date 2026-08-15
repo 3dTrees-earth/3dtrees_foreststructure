@@ -13,12 +13,32 @@ stopifnot(segment_selection_from_names(
   "PredInstance"
 ) == "xyzrn")
 
-stopifnot(identical(DTM_CATALOG_SELECTION, "xyzrn"))
+stopifnot(identical(DTM_CATALOG_SELECTION, "xyz"))
 dtm_body <- paste(deparse(body(write_global_dtm)), collapse = "\n")
 stopifnot(grepl(
   "opt_select(catalog) <- DTM_CATALOG_SELECTION",
   dtm_body,
   fixed = TRUE
+))
+stopifnot(grepl(
+  "assert_catalog_completed(results, \"DTM\")",
+  dtm_body,
+  fixed = TRUE
+))
+stopifnot(!grepl(
+  "populated_or_all_empty_chunk_raster_paths(results, \"DTM\")",
+  dtm_body,
+  fixed = TRUE
+))
+
+chm_body <- paste(deparse(body(write_global_chm)), collapse = "\n")
+stopifnot(grepl(
+  paste0(
+    "build_chunk_virtual_raster\\(\\s*results,\\s*work_directory,",
+    "\\s*\"CHM\",\\s*terra::crs\\(terra::rast\\(dtm_path\\)\\)\\s*\\)"
+  ),
+  chm_body,
+  perl = TRUE
 ))
 
 segment_body <- paste(deparse(body(segment_chunk)), collapse = "\n")

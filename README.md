@@ -37,7 +37,7 @@ reproducible even while `lidR` is absent from the current CRAN package index.
 Published releases are available from the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/3dtrees-earth/3dtrees-foreststructure:v0.1.0
+docker pull ghcr.io/3dtrees-earth/3dtrees-foreststructure:v0.1.1
 ```
 
 Use a version tag for reproducible work. `latest` follows `main`, while
@@ -217,9 +217,11 @@ One run executes these stages in order:
 6. Calculate the upstream tile metrics and publish dimension-specific CSV and
    GeoJSON products plus the PNG and rasters.
 
-`ReturnNumber` and `NumberOfReturns` are retained in the DTM and segmentation
-catalog selections because lidR may require them while decoding or processing
-source data. They are not exported as result columns. Missing configured
+The DTM catalog selection remains the upstream-compatible `xyz`. The PTD/TIN
+path therefore behaves exactly like the supplied reference pipeline, including
+its fallback when return fields are unavailable. `ReturnNumber` and
+`NumberOfReturns` are retained for segmentation together with every required
+instance ExtraByte; they are not exported as result columns. Missing configured
 instance dimensions are skipped and do not fail a dataset.
 
 The main known limit is dense DTM construction: pathological inputs can still
@@ -251,13 +253,14 @@ DATASET150_LAZ=/path/to/80.laz \
 
 This audit is deliberately stricter than the production validator and is not
 part of the release-publishing workflow because the source LAZ is not public.
-The v0.1.0 implementation preserves the row counts but does **not** pass exact
-value parity: the memory-safe DTM path rescales in-memory XY coordinates from
-0.00025 m to 0.01 m where lidR's TIN integer representation requires it. On
-the validated image this changes 23 tile fields and 10 segment fields in at
-least one row; for example, tile 1 `zsd` is 0.2031 instead of 0.2057. Treat
-this as an explicitly flagged scientific deviation, not an exact reproduction
-of the upstream R output.
+Release v0.1.0 incorrectly rescaled in-memory XY coordinates before TIN by
+estimating integer safety from absolute projected coordinates and ignoring LAS
+offsets. It also selected return fields for the DTM catalog, although the
+supplied upstream wrapper selected only XYZ; that changed PTD/TIN cells on some
+inputs. The corrected implementation passes classified LAS coordinates
+directly to pinned lidR 4.3.2, restores the DTM `xyz` selection, retains return
+fields for segmentation, and requires this dataset-150 audit to reproduce the
+upstream values exactly before release.
 
 Validated dataset outputs can also be checked byte-for-byte, excluding only the
 runtime performance report and validation metadata:
@@ -270,9 +273,11 @@ python tests/compare_validated_outputs.py \
 ## Status
 
 The production artifact contract and operational validation are complete. The
-dataset-150 exact-value deviation above remains open and is intentionally
-flagged rather than hidden or automatically corrected. The Galaxy wrapper
-remains a later integration slice.
+corrected implementation passes the synthetic acceptance suite and the strict
+dataset-150 upstream oracle with zero differing scientific CSV values. Release
+v0.1.0 remains available only as historical provenance and must not be used for
+new analysis because of the documented XY-rescaling and DTM-selection issues.
+The Galaxy wrapper remains a later integration slice.
 
 ## Performance
 

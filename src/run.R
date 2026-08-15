@@ -13,7 +13,7 @@ suppressPackageStartupMessages({
 DATA_TABLE_THREADS <- 5L
 SEGMENT_BUCKET_COUNT <- 64L
 MAX_LIDR_POINT_COUNT <- .Machine$integer.max
-DTM_CATALOG_SELECTION <- "xyzrn"
+DTM_CATALOG_SELECTION <- "xyz"
 SEGMENT_CATALOG_BASE_SELECTION <- "xyzrn"
 
 configure_catalog_worker <- function() {
@@ -720,57 +720,6 @@ empty_chunk_raster <- function(chunk, resolution) {
   raster
 }
 
-tin_compatible_xy_scale <- function(las) {
-  xscale <- as.numeric(las@header@PHB[["X scale factor"]])
-  yscale <- as.numeric(las@header@PHB[["Y scale factor"]])
-  if (any(!is.finite(c(xscale, yscale))) ||
-      any(c(xscale, yscale) <= 0)) {
-    stop("LAS header contains invalid XY scale factors")
-  }
-
-  maximum_coordinate <- max(
-    abs(las@data[["X"]]),
-    abs(las@data[["Y"]]),
-    na.rm = TRUE
-  )
-  if (!is.finite(maximum_coordinate)) {
-    stop("LAS chunk contains no finite XY coordinates")
-  }
-
-  # lidR's Delaunay implementation converts absolute XY coordinates to signed
-  # 32-bit integers. Select the smallest decimal LAS scale that keeps that
-  # conversion below 95% of the integer limit, then preserve any coarser input
-  # scale. Typical LAS data already use 0.001 m and pass through unchanged.
-  minimum_safe_scale <- maximum_coordinate /
-    (0.95 * .Machine$integer.max)
-  decimal_safe_scale <- if (minimum_safe_scale > 0) {
-    10^ceiling(log10(minimum_safe_scale))
-  } else {
-    max(xscale, yscale)
-  }
-  target_scale <- max(xscale, yscale, decimal_safe_scale)
-
-  if (isTRUE(all.equal(xscale, target_scale)) &&
-      isTRUE(all.equal(yscale, target_scale))) {
-    return(las)
-  }
-
-  message(sprintf(
-    paste(
-      "Rescaling in-memory DTM XY coordinates from %.12g/%.12g m to",
-      "%.12g m for lidR TIN integer compatibility; source data are unchanged"
-    ),
-    xscale,
-    yscale,
-    target_scale
-  ))
-  las_rescale(
-    las,
-    xscale = target_scale,
-    yscale = target_scale
-  )
-}
-
 classified_ground_surface <- function(las, dtm_resolution) {
   classifications <- las[["Classification"]]
   if (is.null(classifications) || !any(classifications == 2L, na.rm = TRUE)) {
@@ -795,7 +744,6 @@ classified_ground_surface <- function(las, dtm_resolution) {
     )
     return(NULL)
   }
-  las <- tin_compatible_xy_scale(las)
   tryCatch(
     rasterize_terrain(las, res = dtm_resolution, algorithm = tin()),
     error = function(error) {
@@ -872,6 +820,91 @@ virtual_raster_source <- function(result, label) {
     ))
   }
   sources[[1]]
+}
+
+complete_chunk_raster_paths <- function(results, label) {
+  assert_catalog_completed(results, label)
+  paths <- unname(unlist(results, use.names = FALSE))
+  if (length(paths) == 0L || any(!file.exists(paths))) {
+    stop(sprintf(
+      "%s LAScatalog processing did not write every chunk raster",
+      label
+    ))
+  }
+
+  paths
+}
+
+populated_or_all_empty_chunk_raster_paths <- function(paths, label) {
+  has_data <- vapply(paths, function(path) {
+    count <- suppressWarnings(terra::global(terra::rast(path), "notNA"))
+    is.finite(count[[1L, 1L]]) && count[[1L, 1L]] > 0
+  }, logical(1))
+  if (any(has_data)) {
+    return(paths[has_data])
+  }
+
+  message(sprintf(
+    "global %s processing produced only empty chunks; publishing an all-NoData raster",
+    label
+  ))
+  paths
+}
+
+chunk_reference_crs <- function(paths, label) {
+  candidates <- vapply(paths, function(path) {
+    terra::crs(terra::rast(path))
+  }, character(1))
+  candidates <- unique(candidates[!is.na(candidates) & nzchar(candidates)])
+  if (length(candidates) > 1L) {
+    stop(sprintf("%s chunk rasters contain conflicting CRS metadata", label))
+  }
+  if (length(candidates) == 1L) candidates[[1L]] else NA_character_
+}
+
+build_chunk_virtual_raster <- function(results, work_directory, label,
+                                       fallback_crs = NA_character_) {
+  all_paths <- complete_chunk_raster_paths(results, label)
+  reference_crs <- chunk_reference_crs(all_paths, label)
+  if ((is.na(reference_crs) || !nzchar(reference_crs)) &&
+      !is.na(fallback_crs) && nzchar(fallback_crs)) {
+    reference_crs <- fallback_crs
+  }
+  paths <- populated_or_all_empty_chunk_raster_paths(all_paths, label)
+  vrt_path <- file.path(
+    work_directory,
+    sprintf("%s_chunks.vrt", tolower(label))
+  )
+  input_list_path <- file.path(
+    work_directory,
+    sprintf("%s_chunks.txt", tolower(label))
+  )
+  unlink(vrt_path, force = TRUE)
+  writeLines(paths, input_list_path, useBytes = TRUE)
+  arguments <- c("-overwrite")
+  if (!is.na(reference_crs) && nzchar(reference_crs)) {
+    arguments <- c(arguments, "-a_srs", shQuote(reference_crs))
+  }
+  arguments <- c(
+    arguments,
+    "-input_file_list", shQuote(input_list_path),
+    shQuote(vrt_path)
+  )
+  status <- system2("gdalbuildvrt", arguments)
+  if (!identical(status, 0L) || !file.exists(vrt_path)) {
+    stop(sprintf("could not build the global %s chunk VRT", label))
+  }
+  result <- terra::rast(vrt_path)
+  if (!is.na(reference_crs) && nzchar(reference_crs)) {
+    actual_crs <- terra::crs(result)
+    if (is.na(actual_crs) || !nzchar(actual_crs)) {
+      stop(sprintf(
+        "global %s chunk VRT did not persist its reference CRS",
+        label
+      ))
+    }
+  }
+  result
 }
 
 stream_virtual_raster <- function(result, output_path, label) {
@@ -1023,14 +1056,9 @@ write_global_dtm <- function(point_cloud, output_path, work_directory,
     )
   )
   assert_catalog_completed(results, "DTM")
-
-  chunk_paths <- list.files(
-    work_directory,
-    pattern = "^dtm_.+\\.tif$",
-    full.names = TRUE
-  )
-  if (length(chunk_paths) == 0L) {
-    stop("global DTM processing produced no disk-backed chunk rasters")
+  chunk_paths <- sort(unname(unlist(results, use.names = FALSE)))
+  if (length(chunk_paths) == 0L || any(!file.exists(chunk_paths))) {
+    stop("DTM LAScatalog processing did not write every chunk raster")
   }
   mosaic_path <- file.path(work_directory, "dtm_mosaic.tif")
   mosaic <- terra::mosaic(
@@ -1107,8 +1135,12 @@ write_global_chm <- function(point_cloud, dtm_path, output_path, work_directory,
       )
     )
   )
-  assert_catalog_completed(results, "CHM")
-  result <- terra::vrt(unlist(results, use.names = FALSE))
+  result <- build_chunk_virtual_raster(
+    results,
+    work_directory,
+    "CHM",
+    terra::crs(terra::rast(dtm_path))
+  )
   covering <- cover_virtual_raster(
     result,
     point_cloud,

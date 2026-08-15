@@ -8,7 +8,9 @@ input_dir="$(mktemp -d)"
 results_dir="$(mktemp -d)"
 trap 'rm -rf "${input_dir}" "${results_dir}"' EXIT
 
-docker build --tag "${image_name}" "${repo_dir}"
+if [[ "${FORESTSTRUCTURE_SKIP_BUILD:-0}" != "1" ]]; then
+  docker build --tag "${image_name}" "${repo_dir}"
+fi
 docker run --rm --network none \
   "${docker_limits[@]}" \
   --entrypoint Rscript \
@@ -30,6 +32,20 @@ docker run --rm --network none \
   --workdir /workspace/src \
   "${image_name}" \
   -e 'Sys.setenv(FORESTSTRUCTURE_SOURCE_ONLY = "1"); source("run.R"); source("../tests/test_failed_dataset_regressions.R")'
+docker run --rm --network none \
+  "${docker_limits[@]}" \
+  --entrypoint Rscript \
+  --volume "${repo_dir}:/workspace:ro" \
+  --workdir /workspace/src \
+  "${image_name}" \
+  -e 'Sys.setenv(FORESTSTRUCTURE_SOURCE_ONLY = "1"); source("run.R"); source("../tests/test_dtm_coordinate_scale.R")'
+docker run --rm --network none \
+  "${docker_limits[@]}" \
+  --entrypoint Rscript \
+  --volume "${repo_dir}:/workspace:ro" \
+  --workdir /workspace/src \
+  "${image_name}" \
+  -e 'Sys.setenv(FORESTSTRUCTURE_SOURCE_ONLY = "1"); source("run.R"); source("../tests/test_raster_merge_semantics.R")'
 docker run --rm --network none \
   "${docker_limits[@]}" \
   --user "$(id -u):$(id -g)" \
