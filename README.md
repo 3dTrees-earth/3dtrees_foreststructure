@@ -37,7 +37,7 @@ reproducible even while `lidR` is absent from the current CRAN package index.
 Published releases are available from the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/3dtrees-earth/3dtrees-foreststructure:v0.1.1
+docker pull ghcr.io/3dtrees-earth/3dtrees-foreststructure:v0.1.2
 ```
 
 Use a version tag for reproducible work. `latest` follows `main`, while
@@ -114,6 +114,13 @@ degenerate raster chunks contribute aligned no-data rasters; worker errors are
 reported as failures instead of allowing partial scientific outputs. Raster
 extent checks tolerate only coordinate-scale floating-point noise at an
 otherwise identical grid boundary.
+
+Starting with `v0.1.2`, the disk-backed DTM overlap mosaic scans every chunk
+for CRS metadata and uses the point-cloud CRS as a fallback when all chunks are
+CRS-less. This keeps sparse empty chunks while ensuring that the final DTM
+retains its source CRS. Conflicting chunk CRSs still fail validation. The CRS
+is assigned as metadata only; coordinates and raster values are neither
+reprojected nor resampled.
 
 R/lidR cannot represent a single LAS/LAZ/COPC file containing more than
 2,147,483,647 points. Such inputs stop during binary-header preflight with the

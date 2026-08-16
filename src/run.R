@@ -862,6 +862,15 @@ chunk_reference_crs <- function(paths, label) {
   if (length(candidates) == 1L) candidates[[1L]] else NA_character_
 }
 
+spatial_reference_wkt <- function(value) {
+  reference <- sf::st_crs(value)
+  if (is.na(reference) || is.null(reference$wkt) ||
+      is.na(reference$wkt) || !nzchar(reference$wkt)) {
+    return(NA_character_)
+  }
+  reference$wkt
+}
+
 build_chunk_virtual_raster <- function(results, work_directory, label,
                                        fallback_crs = NA_character_) {
   all_paths <- complete_chunk_raster_paths(results, label)
@@ -1039,6 +1048,7 @@ write_global_dtm <- function(point_cloud, output_path, work_directory,
   opt_progress(catalog) <- FALSE
   opt_output_files(catalog) <- file.path(work_directory, "dtm_{ID}")
   catalog@output_options$drivers$SpatRaster$param$datatype <- "FLT8S"
+  source_crs <- spatial_reference_wkt(catalog)
 
   results <- with_catalog_workers(
     workers,
@@ -1060,6 +1070,28 @@ write_global_dtm <- function(point_cloud, output_path, work_directory,
   if (length(chunk_paths) == 0L || any(!file.exists(chunk_paths))) {
     stop("DTM LAScatalog processing did not write every chunk raster")
   }
+  mosaic <- build_dtm_overlap_mosaic(
+    chunk_paths,
+    work_directory,
+    fallback_crs = source_crs
+  )
+  covering <- cover_virtual_raster(
+    mosaic,
+    point_cloud,
+    dtm_resolution,
+    work_directory,
+    "DTM"
+  )
+  stream_virtual_raster(covering, output_path, "DTM")
+}
+
+build_dtm_overlap_mosaic <- function(chunk_paths, work_directory,
+                                     fallback_crs = NA_character_) {
+  reference_crs <- chunk_reference_crs(chunk_paths, "DTM")
+  if ((is.na(reference_crs) || !nzchar(reference_crs)) &&
+      !is.na(fallback_crs) && nzchar(fallback_crs)) {
+    reference_crs <- fallback_crs
+  }
   mosaic_path <- file.path(work_directory, "dtm_mosaic.tif")
   mosaic <- terra::mosaic(
     terra::sprc(lapply(chunk_paths, terra::rast)),
@@ -1075,21 +1107,30 @@ write_global_dtm <- function(point_cloud, output_path, work_directory,
   }
 
   mosaic_vrt_path <- file.path(work_directory, "dtm_mosaic.vrt")
+  arguments <- c("-overwrite")
+  if (!is.na(reference_crs) && nzchar(reference_crs)) {
+    arguments <- c(arguments, "-a_srs", shQuote(reference_crs))
+  }
+  arguments <- c(
+    arguments,
+    shQuote(mosaic_vrt_path),
+    shQuote(mosaic_path)
+  )
   status <- system2(
     "gdalbuildvrt",
-    c(shQuote(mosaic_vrt_path), shQuote(mosaic_path))
+    arguments
   )
   if (!identical(status, 0L) || !file.exists(mosaic_vrt_path)) {
     stop("could not create the global DTM publication VRT")
   }
-  covering <- cover_virtual_raster(
-    terra::rast(mosaic_vrt_path),
-    point_cloud,
-    dtm_resolution,
-    work_directory,
-    "DTM"
-  )
-  stream_virtual_raster(covering, output_path, "DTM")
+  result <- terra::rast(mosaic_vrt_path)
+  if (!is.na(reference_crs) && nzchar(reference_crs)) {
+    actual_crs <- terra::crs(result)
+    if (is.na(actual_crs) || !nzchar(actual_crs)) {
+      stop("global DTM publication VRT did not persist its reference CRS")
+    }
+  }
+  result
 }
 
 chm_chunk <- function(chunk, dtm_path, voxel_resolution, maximum_height,

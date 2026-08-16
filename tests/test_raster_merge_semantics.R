@@ -54,6 +54,48 @@ local({
   )
   stopifnot(!terra::inMemory(fallback_result))
   stopifnot(terra::same.crs(fallback_result, empty_raster))
+
+  # A sparse first DTM chunk can be all-NoData and therefore CRS-less, while a
+  # later populated chunk carries the source CRS. The overlap mosaic must scan
+  # every chunk instead of inheriting only the first chunk's missing metadata.
+  crsless_dtm_path <- file.path(work_directory, "a_empty_dtm.tif")
+  crsless_dtm <- terra::rast(
+    xmin = 1886455,
+    xmax = 1886457,
+    ymin = 5771842,
+    ymax = 5771843,
+    res = 1
+  )
+  terra::values(crsless_dtm) <- c(NA_real_, NA_real_)
+  terra::crs(crsless_dtm) <- ""
+  terra::writeRaster(crsless_dtm, crsless_dtm_path, overwrite = TRUE)
+  stopifnot(!nzchar(terra::crs(terra::rast(crsless_dtm_path))))
+  populated_crs_path <- file.path(work_directory, "b_populated_dtm.tif")
+  populated_crs <- crsless_dtm
+  terra::values(populated_crs) <- c(4, 5)
+  terra::crs(populated_crs) <- "EPSG:2193"
+  terra::writeRaster(populated_crs, populated_crs_path, overwrite = TRUE)
+  dtm_work_directory <- file.path(work_directory, "dtm")
+  dir.create(dtm_work_directory)
+  dtm_result <- build_dtm_overlap_mosaic(
+    c(crsless_dtm_path, populated_crs_path),
+    dtm_work_directory
+  )
+  stopifnot(identical(as.numeric(terra::values(dtm_result)), c(4, 5)))
+  stopifnot(terra::same.crs(dtm_result, terra::rast(populated_crs_path)))
+
+  fallback_dtm_work_directory <- file.path(work_directory, "fallback_dtm")
+  dir.create(fallback_dtm_work_directory)
+  fallback_dtm_result <- build_dtm_overlap_mosaic(
+    crsless_dtm_path,
+    fallback_dtm_work_directory,
+    terra::crs(populated_crs)
+  )
+  stopifnot(all(is.na(as.numeric(terra::values(fallback_dtm_result)))))
+  stopifnot(
+    terra::same.crs(fallback_dtm_result, terra::rast(populated_crs_path))
+  )
+
   point_cloud_path <- file.path(work_directory, "fallback_bounds.las")
   point_cloud <- LAS(data.frame(
     X = c(0.25, 1.75),
