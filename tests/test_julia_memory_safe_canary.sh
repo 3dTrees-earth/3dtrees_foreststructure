@@ -110,7 +110,9 @@ trap finish EXIT
 echo "CANARY dataset=${dataset_id} run_root=${run_root}"
 
 current_step="aoi_conversion"
-docker run --rm --network none --user "$(id -u):$(id -g)" \
+docker run --rm --network none --cpus "${test_cpus}" \
+  --memory 75g --memory-swap 75g --user "$(id -u):$(id -g)" \
+  --env "FORESTSTRUCTURE_THREADS=${test_cpus}" \
   --entrypoint Rscript \
   --volume "${point_cloud}:/in/${point_cloud_name}:ro" \
   --volume "${aoi_geojson}:/in/aoi.geojson:ro" \

@@ -45,9 +45,9 @@ if [[ "${FORESTSTRUCTURE_SKIP_BUILD:-0}" != "1" ]]; then
   docker build --file "${repo_dir}/Dockerfile.julia-memory-safe" --build-arg "VCS_REF=$(git -C "${repo_dir}" rev-parse HEAD)" --build-arg "IMAGE_VERSION=julia-memory-safe-dataset150" --tag "${image_name}" "${repo_dir}"
 fi
 
-docker run --rm --network none --user "$(id -u):$(id -g)" --entrypoint Rscript --volume "${repo_dir}/tests:/tests:ro" --volume "${authoritative_gpkg}:/in/80.gpkg:ro" --volume "${canonical_dir}:/converted" "${image_name}" /tests/create_dataset150_canonical_geojson.R /in/80.gpkg /converted/80.geojson
+docker run --rm --network none --cpus "${test_cpus}" --memory 75g --memory-swap 75g --user "$(id -u):$(id -g)" --entrypoint Rscript --volume "${repo_dir}/tests:/tests:ro" --volume "${authoritative_gpkg}:/in/80.gpkg:ro" --volume "${canonical_dir}:/converted" "${image_name}" /tests/create_dataset150_canonical_geojson.R /in/80.gpkg /converted/80.geojson
 
-docker run --rm --network none --user "$(id -u):$(id -g)" --entrypoint Rscript --volume "${point_cloud}:/in/80.laz:ro" --volume "${canonical_dir}:/converted" "${image_name}" /opt/foreststructure/convert_aoi.R --point-cloud /in/80.laz --aoi-geojson /converted/80.geojson --output-gpkg /converted/80.gpkg --provenance-json /converted/conversion.json
+docker run --rm --network none --cpus "${test_cpus}" --memory 75g --memory-swap 75g --user "$(id -u):$(id -g)" --entrypoint Rscript --volume "${point_cloud}:/in/80.laz:ro" --volume "${canonical_dir}:/converted" "${image_name}" /opt/foreststructure/convert_aoi.R --point-cloud /in/80.laz --aoi-geojson /converted/80.geojson --output-gpkg /converted/80.gpkg --provenance-json /converted/conversion.json
 
 docker run --rm --network none --cpus "${test_cpus}" --memory 75g --memory-swap 75g --user "$(id -u):$(id -g)" --entrypoint bash --volume "${point_cloud}:/in/80.laz:ro" --volume "${canonical_dir}/80.gpkg:/converted/80.gpkg:ro" --volume "${julia_script}:/oracle/Indices_Final_run.R:ro" --volume "${repo_dir}/tests:/tests:ro" --volume "${oracle_root}:/validation" "${image_name}" -c '
   set -euo pipefail
