@@ -38,6 +38,13 @@ docker run --rm --network none \
   --volume "${repo_dir}:/workspace:ro" \
   --workdir /workspace/src \
   "${image_name}" \
+  -e 'Sys.setenv(FORESTSTRUCTURE_SOURCE_ONLY = "1"); source("run.R"); source("../tests/test_julia_memory_safe.R")'
+docker run --rm --network none \
+  "${docker_limits[@]}" \
+  --entrypoint Rscript \
+  --volume "${repo_dir}:/workspace:ro" \
+  --workdir /workspace/src \
+  "${image_name}" \
   -e 'Sys.setenv(FORESTSTRUCTURE_SOURCE_ONLY = "1"); source("run.R"); source("../tests/test_dtm_coordinate_scale.R")'
 docker run --rm --network none \
   "${docker_limits[@]}" \
@@ -46,6 +53,13 @@ docker run --rm --network none \
   --workdir /workspace/src \
   "${image_name}" \
   -e 'Sys.setenv(FORESTSTRUCTURE_SOURCE_ONLY = "1"); source("run.R"); source("../tests/test_raster_merge_semantics.R")'
+docker run --rm --network none \
+  "${docker_limits[@]}" \
+  --entrypoint Rscript \
+  --volume "${repo_dir}:/workspace:ro" \
+  --workdir /workspace/src \
+  "${image_name}" \
+  -e 'Sys.setenv(FORESTSTRUCTURE_SOURCE_ONLY = "1"); source("run.R"); source("aoi_conversion.R"); source("../tests/test_aoi_conversion.R")'
 docker run --rm --network none \
   "${docker_limits[@]}" \
   --user "$(id -u):$(id -g)" \

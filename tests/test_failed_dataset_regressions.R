@@ -21,10 +21,11 @@ stopifnot(grepl(
   fixed = TRUE
 ))
 stopifnot(grepl(
-  "assert_catalog_completed(results, \"DTM\")",
+  "complete_chunk_raster_paths(results, \"DTM\")",
   dtm_body,
   fixed = TRUE
 ))
+stopifnot(!grepl("sort(", dtm_body, fixed = TRUE))
 stopifnot(!grepl(
   "populated_or_all_empty_chunk_raster_paths(results, \"DTM\")",
   dtm_body,
@@ -35,10 +36,15 @@ chm_body <- paste(deparse(body(write_global_chm)), collapse = "\n")
 stopifnot(grepl(
   paste0(
     "build_chunk_virtual_raster\\(\\s*results,\\s*work_directory,",
-    "\\s*\"CHM\",\\s*terra::crs\\(terra::rast\\(dtm_path\\)\\)\\s*\\)"
+    "\\s*\"CHM\",\\s*source_crs\\s*\\)"
   ),
   chm_body,
   perl = TRUE
+))
+stopifnot(grepl(
+  "stream_virtual_raster(covering, output_path, \"CHM\", source_crs)",
+  chm_body,
+  fixed = TRUE
 ))
 
 segment_body <- paste(deparse(body(segment_chunk)), collapse = "\n")

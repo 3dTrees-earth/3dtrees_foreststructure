@@ -44,13 +44,16 @@ def compare_rows(
 
 
 def main() -> None:
-    if len(sys.argv) != 4:
+    if len(sys.argv) not in (4, 6):
         raise SystemExit(
-            "usage: compare_dataset150.py ACTUAL_DIR ORACLE_DIR POINT_CLOUD_BASENAME"
+            "usage: compare_dataset150.py ACTUAL_DIR ORACLE_DIR "
+            "POINT_CLOUD_BASENAME [EXPECTED_SENSOR EXPECTED_COUNTRY]"
         )
     actual_dir = pathlib.Path(sys.argv[1])
     oracle_dir = pathlib.Path(sys.argv[2])
     point_cloud_basename = sys.argv[3]
+    expected_sensor = sys.argv[4] if len(sys.argv) == 6 else "NA"
+    expected_country = sys.argv[5] if len(sys.argv) == 6 else "NA"
 
     tile_oracle_path = oracle_dir / "150_results.csv"
     segment_oracle_path = oracle_dir / "150_segment_diagnostics.csv"
@@ -76,8 +79,14 @@ def main() -> None:
     for label, rows in (("tile", tile_actual), ("segment", segment_actual)):
         if any(row["file"] != point_cloud_basename for row in rows):
             raise AssertionError(f"{label} file metadata is not the input basename")
-        if any(row["sensor"] != "NA" or row["country"] != "NA" for row in rows):
-            raise AssertionError(f"{label} sensor/country metadata must be NA")
+        if any(
+            row["sensor"] != expected_sensor or row["country"] != expected_country
+            for row in rows
+        ):
+            raise AssertionError(
+                f"{label} sensor/country metadata must be "
+                f"{expected_sensor}/{expected_country}"
+            )
 
     differences = compare_rows(
         "tile",

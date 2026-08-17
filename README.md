@@ -45,6 +45,36 @@ Use a version tag for reproducible work. `latest` follows `main`, while
 publishing workflow runs the complete synthetic acceptance suite before it
 pushes an image.
 
+### Julia-faithful memory-safe candidate
+
+A separate candidate entrypoint accepts original single-file LAS/LAZ inputs,
+converts local-XY Audit GeoJSON to a same-basename GeoPackage, reads only XYZ
+plus one active instance ExtraByte, uses one catalog worker by default with a
+validated two-worker override, and enforces a 60 GiB internal budget inside a
+75 GiB/no-additional-swap container:
+
+```bash
+make build-julia-memory-safe
+docker run --rm --network none \
+  --cpus 20 --memory 75g --memory-swap 75g \
+  --user "$(id -u):$(id -g)" \
+  --env FORESTSTRUCTURE_THREADS=20 \
+  --env FORESTSTRUCTURE_CATALOG_WORKERS=2 \
+  -v /local/input:/in:ro -v /local/output:/out -v /local/work:/work \
+  3dtrees-foreststructure:julia-memory-safe-local \
+  --point-cloud /in/original.laz \
+  --aoi-geojson /in/aoi.geojson \
+  --dataset-id 150 --output-dir /out --temp-dir /work \
+  --memory-budget-gib 60 --sensor ULS --country Test
+```
+
+This path always recomputes, even if valid dataset-prefixed artifacts already
+exist. It replaces them only after the fresh incoming set validates. See
+[`JULIA_MEMORY_SAFE.md`](JULIA_MEMORY_SAFE.md) for the exact execution
+differences, failure semantics, selectors, image provenance and the
+zero-tolerance comparisons with Julia's unchanged script on both the supplied
+`80.gpkg` footprint (147 tiles) and production Audit AOI (82 tiles).
+
 ## Run
 
 ```bash
@@ -121,6 +151,13 @@ CRS-less. This keeps sparse empty chunks while ensuring that the final DTM
 retains its source CRS. Conflicting chunk CRSs still fail validation. The CRS
 is assigned as metadata only; coordinates and raster values are neither
 reprojected nor resampled.
+
+For the Julia-memory-safe path, the point-cloud header is authoritative at
+publication time. A source LAS/LAZ without CRS produces final DTM and CHM
+GeoTIFFs with no GDAL coordinate system and CRS-less tile geometries, even when
+`terra` heuristically interprets small local coordinates as longitude and
+latitude. A source with CRS retains its source WKT. This operation changes
+metadata only and never reprojects or resamples values.
 
 R/lidR cannot represent a single LAS/LAZ/COPC file containing more than
 2,147,483,647 points. Such inputs stop during binary-header preflight with the
@@ -260,6 +297,12 @@ DATASET150_LAZ=/path/to/80.laz \
 
 This audit is deliberately stricter than the production validator and is not
 part of the release-publishing workflow because the source LAZ is not public.
+It uses the historical 146-tile
+`tests/fixtures/dataset150/150_upstream_tiles.geojson` footprint. Julia's
+unchanged script run against the authoritative supplied `80.gpkg` instead
+produces 147 tiles; the separate Julia-memory-safe validation preserves that
+authoritative footprint and compares all 147 rows. A second regression converts
+the operational `150_aois.geojson` to `80.gpkg` and compares all 82 rows.
 Release v0.1.0 incorrectly rescaled in-memory XY coordinates before TIN by
 estimating integer safety from absolute projected coordinates and ignoring LAS
 offsets. It also selected return fields for the DTM catalog, although the
@@ -281,10 +324,27 @@ python tests/compare_validated_outputs.py \
 
 The production artifact contract and operational validation are complete. The
 corrected implementation passes the synthetic acceptance suite and the strict
-dataset-150 upstream oracle with zero differing scientific CSV values. Release
-v0.1.0 remains available only as historical provenance and must not be used for
-new analysis because of the documented XY-rescaling and DTM-selection issues.
-The Galaxy wrapper remains a later integration slice.
+dataset-150 upstream oracle with zero differing scientific CSV values.
+The additional medium-large oracle pass found and the current working tree
+corrects two systematic DTM regressions on CRS-less local-coordinate datasets:
+false EPSG:4326 publication and lexical sorting of buffered DTM chunks. The
+ordering fix preserves LAScatalog's numeric result order. Fresh full runs of
+datasets 970 and 2062 now reproduce Julia's tile and segment CSVs byte-for-byte
+and reproduce every DTM cell on the complete shared grid at zero tolerance.
+The publication path now uses pinned lidR 4.3.2's own raster layout instead of
+recomputing ordinary point-covering bounds. A fresh dataset-970 run reproduces
+Julia's complete DTM geometry and all 57,840 cells at zero tolerance, including
+the formerly trimmed negative border. Dataset 2062 still requires a fresh run
+with this correction, and the AOI ring-order gate exposed by dataset 1781
+remains unresolved. The
+Julia-memory-safe image is therefore **not approved for cohort processing
+yet**, despite the corrected scientific values for the two ordering canaries.
+See
+[`MEDIUM_LARGE_VALIDATION.md`](MEDIUM_LARGE_VALIDATION.md) for the five-dataset
+results, correction evidence and remaining work. Release v0.1.0 remains
+available only as historical provenance and must not be used for new analysis
+because of the documented XY-rescaling and DTM-selection issues. The Galaxy
+wrapper remains a later integration slice.
 
 ## Performance
 

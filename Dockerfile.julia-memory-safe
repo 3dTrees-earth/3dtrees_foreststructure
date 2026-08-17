@@ -1,0 +1,28 @@
+ARG BASE_IMAGE=3dtrees-foreststructure:v0.1.2
+FROM ${BASE_IMAGE}
+
+ARG VCS_REF=unknown
+ARG IMAGE_VERSION=julia-memory-safe-local
+ARG LASPY_VERSION=2.6.1
+ARG LAZRS_VERSION=0.7.0
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends python3-pip \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m pip install --no-cache-dir --break-system-packages \
+      "laspy==${LASPY_VERSION}" \
+      "lazrs==${LAZRS_VERSION}" \
+    && python3 -c 'import laspy, lazrs; assert laspy.__version__ == "2.6.1"'
+
+COPY src /opt/foreststructure
+RUN chmod -R a+rX /opt/foreststructure
+
+LABEL org.opencontainers.image.source="https://github.com/3dTrees-earth/3dtrees_foreststructure" \
+      org.opencontainers.image.description="Julia-faithful memory-safe ForestStructure candidate" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.version="${IMAGE_VERSION}" \
+      earth.3dtrees.algorithm-base.image="3dtrees-foreststructure:v0.1.2" \
+      earth.3dtrees.lidr.version="4.3.2" \
+      earth.3dtrees.execution-mode="julia-memory-safe"
+
+ENTRYPOINT ["Rscript", "/opt/foreststructure/run_julia_memory_safe.R"]
