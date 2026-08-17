@@ -148,6 +148,11 @@ docker run --rm --network none \
   --instance-dimension PredInstance_FM
 ```
 
+The default internal guard remains 60 GiB. The validated maximum is 70 GiB;
+the 75 GiB production container uses that maximum while retaining 5 GiB for
+the R runtime, loaded libraries, and non-accounted process overhead. Values
+above 70 GiB are rejected before processing.
+
 The command always recomputes. Existing dataset-prefixed artifacts are moved
 aside only after the fresh candidate set validates, then the new set is
 promoted by same-filesystem renames. A promotion error rolls back the previous

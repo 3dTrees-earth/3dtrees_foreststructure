@@ -16,7 +16,8 @@ run_candidate() {
   local bucket_count="${1:-64}"
   local sensor="${2:-ULS}"
   local country="${3:-Test}"
-  docker run --rm --network none --cpus 2 --memory 4g --memory-swap 4g --user "$(id -u):$(id -g)" --env FORESTSTRUCTURE_THREADS=2 --env "FORESTSTRUCTURE_SEGMENT_BUCKET_COUNT=${bucket_count}" --volume "${test_root}/input/high_ordinal.laz:/in/high_ordinal.laz:ro" --volume "${test_root}/input/aoi.geojson:/in/aoi.geojson:ro" --volume "${test_root}/output:/out" --volume "${test_root}/work:/work" "${image_name}" --point-cloud /in/high_ordinal.laz --aoi-geojson /in/aoi.geojson --dataset-id 150 --output-dir /out --temp-dir /work --memory-budget-gib 3 --sensor "${sensor}" --country "${country}"
+  local memory_budget_gib="${4:-3}"
+  docker run --rm --network none --cpus 2 --memory 4g --memory-swap 4g --user "$(id -u):$(id -g)" --env FORESTSTRUCTURE_THREADS=2 --env "FORESTSTRUCTURE_SEGMENT_BUCKET_COUNT=${bucket_count}" --volume "${test_root}/input/high_ordinal.laz:/in/high_ordinal.laz:ro" --volume "${test_root}/input/aoi.geojson:/in/aoi.geojson:ro" --volume "${test_root}/output:/out" --volume "${test_root}/work:/work" "${image_name}" --point-cloud /in/high_ordinal.laz --aoi-geojson /in/aoi.geojson --dataset-id 150 --output-dir /out --temp-dir /work --memory-budget-gib "${memory_budget_gib}" --sensor "${sensor}" --country "${country}"
 }
 
 run_candidate 2>&1 | tee "${test_root}/first.log"
@@ -36,9 +37,10 @@ test -z "$(find "${test_root}/work" -mindepth 1 -print -quit)"
 
 # A second run must recompute and replace the validated artifacts, not skip.
 # A high bucket count forces tiny disk partitions without changing results.
-run_candidate 256 NA NA 2>&1 | tee "${test_root}/second.log"
+run_candidate 256 NA NA 70 2>&1 | tee "${test_root}/second.log"
 grep -q 'Validated and promoted' "${test_root}/second.log"
 jq -e '.segment_bucket_count == 256' "${test_root}/output/150_julia_memory_safe_run.json" >/dev/null
+jq -e '.memory_budget_gib == 70' "${test_root}/output/150_julia_memory_safe_run.json" >/dev/null
 
 failure_output="${test_root}/failure_output"
 failure_work="${test_root}/failure_work"

@@ -4,6 +4,8 @@ suppressPackageStartupMessages({
   library(lidR)
 })
 
+MAX_MEMORY_BUDGET_GIB <- 70
+
 script_argument <- grep(
   "^--file=",
   commandArgs(trailingOnly = FALSE),
@@ -86,8 +88,11 @@ parse_julia_memory_safe_parameters <- function() {
   }
   if (!is.finite(arguments$memory_budget_gib) ||
       arguments$memory_budget_gib <= 0 ||
-      arguments$memory_budget_gib > 60) {
-    stop("--memory-budget-gib must be greater than zero and at most 60")
+      arguments$memory_budget_gib > MAX_MEMORY_BUDGET_GIB) {
+    stop(sprintf(
+      "--memory-budget-gib must be greater than zero and at most %s",
+      MAX_MEMORY_BUDGET_GIB
+    ))
   }
   arguments
 }

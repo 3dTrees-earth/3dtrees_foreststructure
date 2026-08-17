@@ -23,6 +23,7 @@ LABEL org.opencontainers.image.source="https://github.com/3dTrees-earth/3dtrees_
       org.opencontainers.image.version="${IMAGE_VERSION}" \
       earth.3dtrees.algorithm-base.image="3dtrees-foreststructure:v0.1.2" \
       earth.3dtrees.lidr.version="4.3.2" \
+      earth.3dtrees.memory-budget.max-gib="70" \
       earth.3dtrees.execution-mode="julia-memory-safe"
 
 ENTRYPOINT ["Rscript", "/opt/foreststructure/run_julia_memory_safe.R"]
