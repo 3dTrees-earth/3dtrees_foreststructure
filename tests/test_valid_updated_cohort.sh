@@ -6,7 +6,7 @@ manifest="${1:-${repo_dir}/tests/fixtures/valid_updated_cohort15.tsv}"
 data_root="${FORESTSTRUCTURE_DATA_ROOT:-/mnt/ssds/kg281/foreststructure}"
 package_root="${FORESTSTRUCTURE_PACKAGE_ROOT:-/mnt/gsdata/projects/3dtrees/forest_structure}"
 validation_parent="${VALID_UPDATED_VALIDATION_ROOT:-/mnt/ssds/kg281/_foreststructure_valid_updated_validation}"
-image_name="${FORESTSTRUCTURE_JULIA_IMAGE:-3dtrees-foreststructure:julia-memory-safe-local}"
+image_name="${FORESTSTRUCTURE_JULIA_IMAGE:-3dtrees-foreststructure:copc-local}"
 if [[ ! -f "${manifest}" ]]; then
   echo "cohort manifest not found: ${manifest}" >&2
   exit 2

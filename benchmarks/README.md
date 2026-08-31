@@ -52,8 +52,7 @@ tuple-fingerprint validation over all points. Scientific comparison against
 - 14,632 DTM cells with identical geometry, masks and values; and
 - 57,810 CHM cells with identical geometry, masks and values.
 
-The candidate image was
-`3dtrees-foreststructure:julia-memory-safe-copc-all-instances-dtmfix-20260829`
+The candidate image alias was `3dtrees-foreststructure:copc`
 (`sha256:cfc7948984ab28f8708741d69bf6c7c9a6ed8d7f3eb3377a32db0e0509a98f44`).
 Raw summary values are committed in
 `benchmarks/results/2026-08-31-dataset107.csv`. The large COPC, rasters and

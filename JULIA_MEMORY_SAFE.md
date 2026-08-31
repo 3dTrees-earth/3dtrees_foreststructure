@@ -72,7 +72,7 @@ build the ordered-COPC image:
 ```bash
 make build IMAGE=3dtrees-foreststructure:v0.1.2
 make build-julia-memory-safe \
-  JULIA_MEMORY_SAFE_IMAGE=3dtrees-foreststructure:julia-memory-safe-local
+  JULIA_MEMORY_SAFE_IMAGE=3dtrees-foreststructure:copc-local
 ```
 
 ## Convert an ordered source to canonical COPC
@@ -81,7 +81,7 @@ The helper uses the ForestStructure image to add/validate dimensions and the
 pinned Smart Tile image for Untwine conversion:
 
 ```bash
-FORESTSTRUCTURE_JULIA_IMAGE=3dtrees-foreststructure:julia-memory-safe-local \
+FORESTSTRUCTURE_JULIA_IMAGE=3dtrees-foreststructure:copc-local \
 FORESTSTRUCTURE_TEST_CPUS=10 \
 FORESTSTRUCTURE_TEST_MEMORY_GIB=30 \
 bash tests/build_original_order_copc.sh \
@@ -113,7 +113,7 @@ docker run --rm --network none \
   --volume /local/input:/in:ro \
   --volume /local/output:/out \
   --volume /local/ssd-work:/work \
-  3dtrees-foreststructure:julia-memory-safe-local \
+  3dtrees-foreststructure:copc-local \
   --point-cloud /in/original.indexed.copc.laz \
   --original-point-cloud /in/original.laz \
   --aoi-geojson /in/aoi.geojson \
@@ -156,21 +156,21 @@ Core synthetic suite:
 
 ```bash
 make test-julia-memory-safe \
-  JULIA_MEMORY_SAFE_IMAGE=3dtrees-foreststructure:julia-memory-safe-local
+  JULIA_MEMORY_SAFE_IMAGE=3dtrees-foreststructure:copc-local
 ```
 
 Distinct primary/SAT/FM ordered-LAZ versus COPC differential:
 
 ```bash
 make test-copc-all-instance-dimensions \
-  JULIA_MEMORY_SAFE_IMAGE=3dtrees-foreststructure:julia-memory-safe-local
+  JULIA_MEMORY_SAFE_IMAGE=3dtrees-foreststructure:copc-local
 ```
 
 Dataset 150 against the committed Julia oracle:
 
 ```bash
 make test-julia-memory-safe-dataset150 \
-  JULIA_MEMORY_SAFE_IMAGE=3dtrees-foreststructure:julia-memory-safe-local \
+  JULIA_MEMORY_SAFE_IMAGE=3dtrees-foreststructure:copc-local \
   DATASET150_LAZ=/path/to/80.laz \
   DATASET150_GPKG=/path/to/80.gpkg
 ```
@@ -179,7 +179,7 @@ One canonical COPC against a `valid_updated` oracle:
 
 ```bash
 make test-valid-updated-copc-alignment \
-  JULIA_MEMORY_SAFE_IMAGE=3dtrees-foreststructure:julia-memory-safe-local \
+  JULIA_MEMORY_SAFE_IMAGE=3dtrees-foreststructure:copc-local \
   DATASET_ID=150 \
   COPC_LAZ=/path/to/150.indexed.copc.laz \
   ORIGINAL_LAZ=/path/to/original.laz \

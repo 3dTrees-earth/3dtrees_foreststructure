@@ -13,8 +13,7 @@ execution difference from that script.
 ## Implementation and image comparison
 
 As observed on 2026-08-31, eight active `valid_updated` workers use the
-direct-LAZ image
-`3dtrees-foreststructure:julia-faithful-singlefile-fixeddatasets-memory70-20260817`.
+direct-LAZ image alias `3dtrees-foreststructure:direct`.
 It is different from the ordered-COPC image proposed as its replacement.
 
 | Property | Original Julia script | Currently running image | Ordered-COPC optimized image |
@@ -81,7 +80,7 @@ internal budget and one LAScatalog worker:
 
 ```bash
 make build-julia-memory-safe
-FORESTSTRUCTURE_JULIA_IMAGE=3dtrees-foreststructure:julia-memory-safe-local \
+FORESTSTRUCTURE_JULIA_IMAGE=3dtrees-foreststructure:copc-local \
   bash tests/build_original_order_copc.sh \
   /local/input/original.laz \
   /local/input/original.indexed.copc.laz
@@ -92,7 +91,7 @@ docker run --rm --network none \
   --env FORESTSTRUCTURE_THREADS=10 \
   --env FORESTSTRUCTURE_CATALOG_WORKERS=1 \
   -v /local/input:/in:ro -v /local/output:/out -v /local/work:/work \
-  3dtrees-foreststructure:julia-memory-safe-local \
+  3dtrees-foreststructure:copc-local \
   --point-cloud /in/original.indexed.copc.laz \
   --original-point-cloud /in/original.laz \
   --aoi-geojson /in/aoi.geojson \

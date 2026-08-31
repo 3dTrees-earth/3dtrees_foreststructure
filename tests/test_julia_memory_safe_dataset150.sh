@@ -27,7 +27,7 @@ assert_sha256 "${point_cloud}" d767997ce5868a98fb9dc0a688cb3d300fc8b7cee45571ead
 assert_sha256 "${authoritative_gpkg}" cc7befe0c55ce5e09c66c4eda062cbc947937ea005e7cc80161a028685f5c643
 assert_sha256 "${julia_script}" 746d57b4c937001af31e4ccd1b9f14edb5cebb15d46154ad9e20d0ce39f78226
 
-image_name="${FORESTSTRUCTURE_JULIA_IMAGE:-3dtrees-foreststructure:julia-memory-safe-local}"
+image_name="${FORESTSTRUCTURE_JULIA_IMAGE:-3dtrees-foreststructure:copc-local}"
 catalog_workers="${FORESTSTRUCTURE_CATALOG_WORKERS:-2}"
 test_cpus="${FORESTSTRUCTURE_TEST_CPUS:-15}"
 validation_parent="${DATASET150_VALIDATION_ROOT:-/mnt/ssds/kg281/_foreststructure_julia_memory_safe_validation}"

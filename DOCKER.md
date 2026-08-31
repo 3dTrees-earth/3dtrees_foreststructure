@@ -14,7 +14,7 @@ particular container will still be running later.
 | Property | Observed value |
 | --- | --- |
 | Active workers | 8 |
-| Image tag | `3dtrees-foreststructure:julia-faithful-singlefile-fixeddatasets-memory70-20260817` |
+| Short image alias | `3dtrees-foreststructure:direct` |
 | Local Docker image ID | `sha256:8b7b6e4a0a5bbbe1f3fd0422ee5d05817994158a4c3de3f066311f6c41fc6df8` |
 | Image source revision | `11d56311fc340421d09d6d448d218f2130d02191` |
 | Entrypoint | `Rscript /opt/foreststructure/run_julia_memory_safe.R` |
@@ -58,7 +58,7 @@ docker run --rm --network none \
   --volume /local/input:/in:ro \
   --volume /local/output:/out \
   --volume /local/ssd-work:/work \
-  3dtrees-foreststructure:julia-faithful-singlefile-fixeddatasets-memory70-20260817 \
+  3dtrees-foreststructure:direct \
   --point-cloud /in/original.laz \
   --aoi-geojson /in/aoi.geojson \
   --dataset-id 150 \
@@ -94,9 +94,8 @@ a failure or daemon restart.
 | Main limitation | Workstation paths, no bounded container contract and only primary segmentation | Reads original LAZ repeatedly; no COPC spatial pruning; no automatic restart | Requires one-time canonical COPC conversion and a complete unique `OriginalPointIndex` |
 | Release status | Reference file, not an image | Historical local operational image currently running | Validated local candidate; publish by immutable Git SHA/registry digest after merge |
 
-The optimized local image
-`3dtrees-foreststructure:julia-memory-safe-copc-all-instances-dtmfix-20260829`
-has local Docker image ID
+The optimized local image alias `3dtrees-foreststructure:copc` has local Docker
+image ID
 `sha256:cfc7948984ab28f8708741d69bf6c7c9a6ed8d7f3eb3377a32db0e0509a98f44`.
 The five files installed under `/opt/foreststructure` were hash-checked against
 commit `7ea0302` on 2026-08-31 and matched exactly. The tag is still a local
@@ -108,7 +107,7 @@ Build the ordered-COPC implementation from the reviewed source:
 
 ```bash
 make build-julia-memory-safe \
-  JULIA_MEMORY_SAFE_IMAGE=3dtrees-foreststructure:julia-memory-safe-local
+  JULIA_MEMORY_SAFE_IMAGE=3dtrees-foreststructure:copc-local
 ```
 
 Create the canonical COPC once, then run the 10-CPU/30-GiB profile. Complete

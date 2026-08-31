@@ -3,7 +3,7 @@
 IMAGE ?= 3dtrees-foreststructure:local
 VCS_REF ?= $(shell git rev-parse HEAD 2>/dev/null || printf unknown)
 IMAGE_VERSION ?= local
-JULIA_MEMORY_SAFE_IMAGE ?= 3dtrees-foreststructure:julia-memory-safe-local
+JULIA_MEMORY_SAFE_IMAGE ?= 3dtrees-foreststructure:copc-local
 JULIA_ORIGINAL_SCRIPT ?= reference/Indices_Final_run.R
 
 build:

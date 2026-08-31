@@ -23,7 +23,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-forest_image="${FORESTSTRUCTURE_JULIA_IMAGE:-3dtrees-foreststructure:julia-memory-safe-local}"
+forest_image="${FORESTSTRUCTURE_JULIA_IMAGE:-3dtrees-foreststructure:copc-local}"
 smart_tile_image="${FORESTSTRUCTURE_SMART_TILE_IMAGE:-3dtrees-smart-tile:34f492a-v2.3.1}"
 test_cpus="${FORESTSTRUCTURE_TEST_CPUS:-10}"
 container_memory_gib="${FORESTSTRUCTURE_TEST_MEMORY_GIB:-30}"

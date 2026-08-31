@@ -27,7 +27,7 @@ assert_sha256 "${point_cloud}" d767997ce5868a98fb9dc0a688cb3d300fc8b7cee45571ead
 assert_sha256 "${operational_geojson}" 1d565d50081d97b782965fa58319e6f659ccc2f2a0da3932c5057506be3f7385
 assert_sha256 "${julia_script}" 746d57b4c937001af31e4ccd1b9f14edb5cebb15d46154ad9e20d0ce39f78226
 
-image_name="${FORESTSTRUCTURE_JULIA_IMAGE:-3dtrees-foreststructure:julia-memory-safe-local}"
+image_name="${FORESTSTRUCTURE_JULIA_IMAGE:-3dtrees-foreststructure:copc-local}"
 validation_parent="${DATASET150_VALIDATION_ROOT:-/mnt/ssds/kg281/_foreststructure_julia_memory_safe_validation}"
 mkdir -p "${validation_parent}"
 run_root="$(mktemp -d "${validation_parent}/dataset150_operational_aoi_XXXXXXXX")"
