@@ -10,6 +10,30 @@ is `746d57b4c937001af31e4ccd1b9f14edb5cebb15d46154ad9e20d0ce39f78226`.
 [`CHANGELOG.md`](CHANGELOG.md) documents every intentional implementation and
 execution difference from that script.
 
+## Implementation and image comparison
+
+As observed on 2026-08-31, eight active `valid_updated` workers use the
+direct-LAZ image
+`3dtrees-foreststructure:julia-faithful-singlefile-fixeddatasets-memory70-20260817`.
+It is different from the ordered-COPC image proposed as its replacement.
+
+| Property | Original Julia script | Currently running image | Ordered-COPC optimized image |
+| --- | --- | --- | --- |
+| Source/version | Immutable `reference/Indices_Final_run.R` | Revision `11d5631`, local image ID `8b7b6e4a0a5b…` | Commit `7ea0302`, validated local image ID `cfc7948984ab…` |
+| Input | Original LAS/LAZ files discovered in TLS/MLS/ULS folders | One original LAS/LAZ; COPC is rejected | One canonical COPC with `OriginalPointIndex`; optional original companion for preflight only |
+| Point order | Original record order | Original record order | COPC spatial read followed by original-order restoration in every chunk |
+| Instance dimensions | `PredInstance` | `PredInstance`, `_SAT`, `_FM` | `PredInstance`, `_SAT`, `_FM` |
+| Spatial streaming | LAScatalog on original LAS/LAZ | LAScatalog on original LAS/LAZ | COPC spatial pruning remains active throughout analysis |
+| Controlled resources | None in the script | 12 CPUs, 37 GiB hard limit, 32 GiB internal budget, 2 catalog workers | 10 CPUs, 30 GiB hard limit, 25 GiB internal budget, 1 catalog worker |
+| Restart behavior | Not applicable | Observed policy `no`; stopped workers do not restart automatically | Set by the launcher; the documented validation command uses `--rm` and no restart policy |
+| Validation role | Scientific oracle | Produces the direct-LAZ `valid_updated` baseline | Reproduced the baseline exactly on the validated cohorts while retaining COPC access |
+| Status | Reference, not a container release | Historical local operational image currently running | Validated candidate; publish by immutable SHA/digest after merge |
+
+[`DOCKER.md`](DOCKER.md) records the full runtime profile, generic Docker
+commands, image identities, output differences, scientific evidence and
+migration guidance. The snapshot is deliberately dated because running
+container state can change independently of this repository.
+
 The container accepts exactly one LAS/LAZ point cloud. A GeoJSON or GeoPackage
 Audit AOI is optional. Without `--aoi`, the tool reads the XY extent from the
 point-cloud header and creates the minimum number of complete square tiles

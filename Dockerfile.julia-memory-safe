@@ -6,6 +6,11 @@ ARG IMAGE_VERSION=julia-memory-safe-local
 ARG LASPY_VERSION=2.6.1
 ARG LAZRS_VERSION=0.7.0
 
+# This Dockerfile builds the ordered-COPC implementation at the checked-out
+# revision. The eight direct-LAZ workers observed on 2026-08-31 use the
+# historical form of this Dockerfile at revision 11d5631. See DOCKER.md for
+# exact image identities, resource profiles and the three-way comparison.
+
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends python3-pip \
     && rm -rf /var/lib/apt/lists/* \
@@ -18,13 +23,18 @@ COPY src /opt/foreststructure
 RUN chmod -R a+rX /opt/foreststructure
 
 LABEL org.opencontainers.image.source="https://github.com/3dTrees-earth/3dtrees_foreststructure" \
-      org.opencontainers.image.description="Ordered-COPC Julia-parity ForestStructure pipeline" \
+      org.opencontainers.image.title="3Dtrees ForestStructure ordered-COPC" \
+      org.opencontainers.image.description="Julia-parity forest metrics with COPC spatial streaming and OriginalPointIndex order restoration" \
+      org.opencontainers.image.documentation="https://github.com/3dTrees-earth/3dtrees_foreststructure/blob/main/DOCKER.md" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.version="${IMAGE_VERSION}" \
       earth.3dtrees.algorithm-base.image="3dtrees-foreststructure:v0.1.2" \
       earth.3dtrees.lidr.version="4.3.2" \
       earth.3dtrees.memory-budget.max-gib="70" \
       earth.3dtrees.execution-mode="julia-memory-safe" \
+      earth.3dtrees.input-mode="original-las-or-canonical-ordered-copc" \
+      earth.3dtrees.point-order="OriginalPointIndex" \
+      earth.3dtrees.reference.sha256="746d57b4c937001af31e4ccd1b9f14edb5cebb15d46154ad9e20d0ce39f78226" \
       earth.3dtrees.instance-dimensions="PredInstance,PredInstance_SAT,PredInstance_FM"
 
 ENTRYPOINT ["Rscript", "/opt/foreststructure/run_julia_memory_safe.R"]

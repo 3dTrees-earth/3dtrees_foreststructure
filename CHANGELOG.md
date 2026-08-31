@@ -12,6 +12,20 @@ The reference file is unchanged and has SHA-256
 
 ## Unreleased — ordered-COPC Julia-parity pipeline
 
+### Docker and implementation documentation
+
+- Added a dated description of the eight direct-LAZ containers currently
+  producing the `valid_updated` baseline, including their exact image/source
+  identities, entrypoint, input contract, CPU and memory limits, worker counts
+  and non-restarting lifecycle.
+- Added a three-way comparison of the immutable Julia script, the currently
+  running direct-LAZ image and the ordered-COPC optimized image.
+- Expanded the ordered-COPC OCI image metadata to expose its documentation,
+  canonical input mode, point-order contract, supported dimensions and
+  scientific-reference hash through `docker inspect`.
+- These changes are documentation and image metadata only; they do not modify
+  the R calculations or the behavior of containers that are already running.
+
 ### Outcome
 
 The new execution path preserves the reference script's calculations while
