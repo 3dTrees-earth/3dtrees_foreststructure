@@ -1,0 +1,2 @@
+# Preserve the immutable scientific oracle byte-for-byte, including CRLF.
+reference/Indices_Final_run.R -text whitespace=cr-at-eol,-blank-at-eof

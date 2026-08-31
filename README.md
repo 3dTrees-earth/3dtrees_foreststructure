@@ -4,6 +4,35 @@
 Analysis Tiles across a point cloud, optionally constrained by an audited
 footprint.
 
+The unchanged scientific reference is committed at
+[`reference/Indices_Final_run.R`](reference/Indices_Final_run.R). Its SHA-256
+is `746d57b4c937001af31e4ccd1b9f14edb5cebb15d46154ad9e20d0ce39f78226`.
+[`CHANGELOG.md`](CHANGELOG.md) documents every intentional implementation and
+execution difference from that script.
+
+## Implementation and image comparison
+
+As observed on 2026-08-31, eight active `valid_updated` workers use the
+direct-LAZ image alias `3dtrees-foreststructure:direct`.
+It is different from the ordered-COPC image proposed as its replacement.
+
+| Property | Original Julia script | Currently running image | Ordered-COPC optimized image |
+| --- | --- | --- | --- |
+| Source/version | Immutable `reference/Indices_Final_run.R` | Revision `11d5631`, local image ID `8b7b6e4a0a5b…` | Commit `7ea0302`, validated local image ID `cfc7948984ab…` |
+| Input | Original LAS/LAZ files discovered in TLS/MLS/ULS folders | One original LAS/LAZ; COPC is rejected | One canonical COPC with `OriginalPointIndex`; optional original companion for preflight only |
+| Point order | Original record order | Original record order | COPC spatial read followed by original-order restoration in every chunk |
+| Instance dimensions | `PredInstance` | `PredInstance`, `_SAT`, `_FM` | `PredInstance`, `_SAT`, `_FM` |
+| Spatial streaming | LAScatalog on original LAS/LAZ | LAScatalog on original LAS/LAZ | COPC spatial pruning remains active throughout analysis |
+| Controlled resources | None in the script | 12 CPUs, 37 GiB hard limit, 32 GiB internal budget, 2 catalog workers | 10 CPUs, 30 GiB hard limit, 25 GiB internal budget, 1 catalog worker |
+| Restart behavior | Not applicable | Observed policy `no`; stopped workers do not restart automatically | Set by the launcher; the documented validation command uses `--rm` and no restart policy |
+| Validation role | Scientific oracle | Produces the direct-LAZ `valid_updated` baseline | Reproduced the baseline exactly on the validated cohorts while retaining COPC access |
+| Status | Reference, not a container release | Historical local operational image currently running | Validated candidate; publish by immutable SHA/digest after merge |
+
+[`DOCKER.md`](DOCKER.md) records the full runtime profile, generic Docker
+commands, image identities, output differences, scientific evidence and
+migration guidance. The snapshot is deliberately dated because running
+container state can change independently of this repository.
+
 The container accepts exactly one LAS/LAZ point cloud. A GeoJSON or GeoPackage
 Audit AOI is optional. Without `--aoi`, the tool reads the XY extent from the
 point-cloud header and creates the minimum number of complete square tiles
@@ -34,16 +63,47 @@ The image pins the complete `lidR` 4.3.2 source archive and verifies its
 SHA-256 digest during the build. This keeps the PTD implementation
 reproducible even while `lidR` is absent from the current CRAN package index.
 
-Published releases are available from the GitHub Container Registry:
+The historical `v0.1.0` release predates the ordered-COPC parity work and must
+not be used for new scientific processing. After this work is reviewed and
+merged, use the immutable `sha-<commit>` GitHub Container Registry tag or a new
+release tag created from that merge commit. Historical tags and commits remain
+available as provenance and are not rewritten.
+
+### Ordered-COPC Julia-parity pipeline
+
+The validated entrypoint accepts an original LAS/LAZ or a canonical COPC with
+`OriginalPointIndex`, converts local-XY Audit GeoJSON to a same-basename
+GeoPackage, restores original record order after every spatial COPC read and
+processes `PredInstance`, `PredInstance_SAT` and `PredInstance_FM`
+independently. The controlled profile is 10 CPUs, 30 GiB hard memory, a 25 GiB
+internal budget and one LAScatalog worker:
 
 ```bash
-docker pull ghcr.io/3dtrees-earth/3dtrees-foreststructure:v0.1.0
+make build-julia-memory-safe
+FORESTSTRUCTURE_JULIA_IMAGE=3dtrees-foreststructure:copc-local \
+  bash tests/build_original_order_copc.sh \
+  /local/input/original.laz \
+  /local/input/original.indexed.copc.laz
+
+docker run --rm --network none \
+  --cpus 10 --memory 30g --memory-swap 30g \
+  --user "$(id -u):$(id -g)" \
+  --env FORESTSTRUCTURE_THREADS=10 \
+  --env FORESTSTRUCTURE_CATALOG_WORKERS=1 \
+  -v /local/input:/in:ro -v /local/output:/out -v /local/work:/work \
+  3dtrees-foreststructure:copc-local \
+  --point-cloud /in/original.indexed.copc.laz \
+  --original-point-cloud /in/original.laz \
+  --aoi-geojson /in/aoi.geojson \
+  --dataset-id 150 --output-dir /out --temp-dir /work \
+  --memory-budget-gib 25 --sensor ULS --country Test
 ```
 
-Use a version tag for reproducible work. `latest` follows `main`, while
-`sha-<commit>` identifies the image built from one exact Git commit. The
-publishing workflow runs the complete synthetic acceptance suite before it
-pushes an image.
+This path always recomputes, even if valid dataset-prefixed artifacts already
+exist. It replaces them only after the fresh incoming set validates. See
+[`JULIA_MEMORY_SAFE.md`](JULIA_MEMORY_SAFE.md) for the exact execution
+differences, failure semantics, selectors, resource contract and validation
+commands.
 
 ## Run
 
@@ -97,23 +157,38 @@ segment CSV; every tree/segment field in the fallback tile CSV is `NA`. Trees
 are aggregated globally within each dimension and assigned to exactly one tile
 by their apex, including trees spanning tile boundaries.
 
-The global segment pass reads XYZ plus only the selected ExtraBytes positions.
-When a requested dimension occurs beyond lidR's individually selectable first
-nine ExtraBytes fields, it falls back to XYZ plus all ExtraBytes, never the
-all-attribute wildcard. Per-chunk voxel, layer, and apex summaries are written
-to temporary uncompressed RDS files partitioned into 64 deterministic
-instance-ID buckets. The parent finalizes one bucket at a time and deletes the
-temporary store on success or failure. This preserves global tree metrics and
-output ordering while preventing all chunk summaries and their concatenated
-copies from occupying memory simultaneously. Chunks with multiple available
-instance dimensions also build and spill those dimension summaries
-sequentially, so SAT/FM alternatives do not multiply the chunk's peak memory.
+The global segment pass reads XYZ plus only the active instance ExtraByte. For
+an original non-COPC input whose dimension occurs after lidR's individually
+selectable first nine ExtraBytes, the ordered pipeline creates a validated
+temporary single-dimension projection. The canonical COPC builder places the
+order and supported instance dimensions first; runtime preflight rejects a
+non-canonical COPC rather than loading every ExtraByte. Per-chunk voxel, layer
+and apex summaries are written to temporary uncompressed RDS files partitioned
+into 64 deterministic instance-ID buckets. The parent finalizes one bucket at
+a time and deletes the temporary store on success or failure. This preserves
+global tree metrics and output ordering while preventing all chunk summaries
+and their concatenated copies from occupying memory simultaneously. Instance
+dimensions are processed sequentially, so SAT/FM alternatives do not multiply
+the chunk's peak memory.
 
 Every DTM, CHM, and segment catalog chunk must complete. Empty or geometrically
 degenerate raster chunks contribute aligned no-data rasters; worker errors are
 reported as failures instead of allowing partial scientific outputs. Raster
 extent checks tolerate only coordinate-scale floating-point noise at an
 otherwise identical grid boundary.
+
+The disk-backed DTM overlap mosaic scans every chunk for CRS metadata and uses
+the point-cloud CRS as a fallback when all chunks are CRS-less. This keeps
+sparse empty chunks while ensuring that the final DTM retains its source CRS.
+Conflicting chunk CRSs still fail validation. The CRS is assigned as metadata
+only; coordinates and raster values are neither reprojected nor resampled.
+
+For the Julia-memory-safe path, the point-cloud header is authoritative at
+publication time. A source LAS/LAZ without CRS produces final DTM and CHM
+GeoTIFFs with no GDAL coordinate system and CRS-less tile geometries, even when
+`terra` heuristically interprets small local coordinates as longitude and
+latitude. A source with CRS retains its source WKT. This operation changes
+metadata only and never reprojects or resamples values.
 
 R/lidR cannot represent a single LAS/LAZ/COPC file containing more than
 2,147,483,647 points. Such inputs stop during binary-header preflight with the
@@ -217,9 +292,11 @@ One run executes these stages in order:
 6. Calculate the upstream tile metrics and publish dimension-specific CSV and
    GeoJSON products plus the PNG and rasters.
 
-`ReturnNumber` and `NumberOfReturns` are retained in the DTM and segmentation
-catalog selections because lidR may require them while decoding or processing
-source data. They are not exported as result columns. Missing configured
+The DTM catalog selection remains the upstream-compatible `xyz`. The PTD/TIN
+path therefore behaves exactly like the supplied reference pipeline, including
+its fallback when return fields are unavailable. `ReturnNumber` and
+`NumberOfReturns` are retained for segmentation together with every required
+instance ExtraByte; they are not exported as result columns. Missing configured
 instance dimensions are skipped and do not fail a dataset.
 
 The main known limit is dense DTM construction: pathological inputs can still
@@ -251,13 +328,18 @@ DATASET150_LAZ=/path/to/80.laz \
 
 This audit is deliberately stricter than the production validator and is not
 part of the release-publishing workflow because the source LAZ is not public.
-The v0.1.0 implementation preserves the row counts but does **not** pass exact
-value parity: the memory-safe DTM path rescales in-memory XY coordinates from
-0.00025 m to 0.01 m where lidR's TIN integer representation requires it. On
-the validated image this changes 23 tile fields and 10 segment fields in at
-least one row; for example, tile 1 `zsd` is 0.2031 instead of 0.2057. Treat
-this as an explicitly flagged scientific deviation, not an exact reproduction
-of the upstream R output.
+It uses the historical 146-tile
+`tests/fixtures/dataset150/150_upstream_tiles.geojson` footprint. Julia's
+unchanged script run against the authoritative supplied `80.gpkg` instead
+produces 147 tiles; the separate Julia-memory-safe validation preserves that
+authoritative footprint and compares all 147 rows. A second regression converts
+the operational `150_aois.geojson` to `80.gpkg` and compares all 82 rows.
+The historical implementation incorrectly rescaled ordinary in-memory XY
+coordinates before TIN and selected return fields for the DTM catalog. The
+current implementation first passes classified coordinates directly to pinned
+lidR 4.3.2 and preserves the DTM `xyz` selection. Only the exact fine-coordinate
+integer-conversion failure triggers a guarded in-memory DTM retry. Return fields
+remain available where segmentation needs them.
 
 Validated dataset outputs can also be checked byte-for-byte, excluding only the
 runtime performance report and validation metadata:
@@ -269,10 +351,23 @@ python tests/compare_validated_outputs.py \
 
 ## Status
 
-The production artifact contract and operational validation are complete. The
-dataset-150 exact-value deviation above remains open and is intentionally
-flagged rather than hidden or automatically corrected. The Galaxy wrapper
-remains a later integration slice.
+The ordered-COPC implementation has passed zero-tolerance scientific
+validation:
+
+- 36 real production datasets reproduced `valid_updated` exactly for
+  `PredInstance`;
+- dataset 2160 reproduced an ordered source-LAZ run exactly for both
+  `PredInstance_SAT` and `PredInstance_FM`, including every CSV value, all 85
+  segment rows, GeoJSON, DTM and CHM;
+- the dataset-2160 ordered-LAZ and COPC DTM/CHM files were byte-identical;
+- a synthetic fixture with deliberately different primary/SAT/FM labels
+  produced byte-identical ordered-LAZ and COPC output for all 15 artifacts.
+
+The validated local image is not itself a published release. Review and merge
+this branch, then publish an immutable SHA/container-digest image before
+changing production workers. Complete evidence, prior failure explanations and
+intentional differences from the Julia script are in
+[`CHANGELOG.md`](CHANGELOG.md).
 
 ## Performance
 

@@ -123,8 +123,12 @@ def verify_dimension(
     verify_geojson(geojson_path, rows, expected_tiles)
     if output_dir.name == "inclusion_only":
         actual_rumple = [float(row["rumple"]) for row in rows]
-        if actual_rumple != [12.1396, 12.0178, 12.3963, 12.9283]:
-            raise SystemExit("tile rumple values differ from upstream")
+        expected_rumple = [12.1396, 12.0178, 12.2369, 12.72]
+        if actual_rumple != expected_rumple:
+            raise SystemExit(
+                "tile rumple values differ from direct-TIN regression: "
+                f"expected={expected_rumple}, actual={actual_rumple}"
+            )
     return result_path
 
 

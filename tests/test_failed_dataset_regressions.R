@@ -13,11 +13,54 @@ stopifnot(segment_selection_from_names(
   "PredInstance"
 ) == "xyzrn")
 
-stopifnot(identical(DTM_CATALOG_SELECTION, "xyzrn"))
+stopifnot(identical(DTM_CATALOG_SELECTION, "xyz"))
+fine_scale_las <- LAS(data.frame(
+  X = c(226990.0000001, 226991.0000002, 226990.5000003),
+  Y = c(378990.0000001, 378990.5000002, 378991.0000003),
+  Z = c(357, 358, 359)
+))
+fine_scale_las@header@PHB[["X scale factor"]] <- 1e-7
+fine_scale_las@header@PHB[["Y scale factor"]] <- 1e-7
+tin_safe_las <- tin_compatible_xy_scale(fine_scale_las)
+stopifnot(isTRUE(all.equal(
+  as.numeric(tin_safe_las@header@PHB[["X scale factor"]]),
+  0.001
+)))
+stopifnot(isTRUE(all.equal(
+  as.numeric(tin_safe_las@header@PHB[["Y scale factor"]]),
+  0.001
+)))
 dtm_body <- paste(deparse(body(write_global_dtm)), collapse = "\n")
 stopifnot(grepl(
-  "opt_select(catalog) <- DTM_CATALOG_SELECTION",
+  "catalog_selection_for_dimensions",
   dtm_body,
+  fixed = TRUE
+))
+stopifnot(grepl("DTM_CATALOG_SELECTION", dtm_body, fixed = TRUE))
+stopifnot(grepl(
+  "complete_chunk_raster_paths(results, \"DTM\")",
+  dtm_body,
+  fixed = TRUE
+))
+stopifnot(!grepl("sort(", dtm_body, fixed = TRUE))
+stopifnot(!grepl(
+  "populated_or_all_empty_chunk_raster_paths(results, \"DTM\")",
+  dtm_body,
+  fixed = TRUE
+))
+
+chm_body <- paste(deparse(body(write_global_chm)), collapse = "\n")
+stopifnot(grepl(
+  paste0(
+    "build_chunk_virtual_raster\\(\\s*results,\\s*work_directory,",
+    "\\s*\"CHM\",\\s*source_crs\\s*\\)"
+  ),
+  chm_body,
+  perl = TRUE
+))
+stopifnot(grepl(
+  "stream_virtual_raster(covering, output_path, \"CHM\", source_crs)",
+  chm_body,
   fixed = TRUE
 ))
 

@@ -39,6 +39,7 @@ fi
 docker run --rm --network none \
   --cpus "${threads}" \
   --memory "${memory}" \
+  --memory-swap "${memory}" \
   --user "$(id -u):$(id -g)" \
   --volume "${point_cloud}:/in/$(basename "${point_cloud}"):ro" \
   --volume "${fixture_dir}:/fixtures:ro" \
@@ -49,6 +50,10 @@ docker run --rm --network none \
   --dataset-id 150 \
   --output-dir /out \
   --threads "${threads}" \
+  --catalog-workers 2 \
+  --dtm-chunk-size 60 \
+  --chunk-size 60 \
+  --dtm-buffer 20 \
   --performance-report
 
 python "${repo_dir}/tests/compare_dataset150.py" \

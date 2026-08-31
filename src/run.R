@@ -13,8 +13,106 @@ suppressPackageStartupMessages({
 DATA_TABLE_THREADS <- 5L
 SEGMENT_BUCKET_COUNT <- 64L
 MAX_LIDR_POINT_COUNT <- .Machine$integer.max
-DTM_CATALOG_SELECTION <- "xyzrn"
+DTM_CATALOG_SELECTION <- "xyz"
 SEGMENT_CATALOG_BASE_SELECTION <- "xyzrn"
+JULIA_MEMORY_SAFE_SEGMENT_SELECTION <- "xyz"
+
+restore_original_point_order <- function(las, point_order_dimension = NULL,
+                                         phase = "analysis") {
+  if (is.null(point_order_dimension) || is.empty(las)) return(las)
+  if (!point_order_dimension %in% names(las@data)) {
+    stop(sprintf(
+      "%s did not load required point-order dimension %s",
+      phase,
+      point_order_dimension
+    ))
+  }
+  point_order <- las@data[[point_order_dimension]]
+  if (anyNA(point_order) || anyDuplicated(point_order)) {
+    stop(sprintf(
+      "%s received missing or duplicate %s values",
+      phase,
+      point_order_dimension
+    ))
+  }
+  las@data <- las@data[order(point_order), ]
+  las
+}
+
+parameter_or <- function(parameters, name, default) {
+  value <- parameters[[name]]
+  if (is.null(value)) default else value
+}
+
+validated_catalog_worker_count <- function(value, thread_budget) {
+  workers <- suppressWarnings(as.integer(value))
+  if (length(workers) != 1L || is.na(workers) ||
+      !workers %in% c(1L, 2L)) {
+    stop("FORESTSTRUCTURE_CATALOG_WORKERS must be 1 or 2")
+  }
+  if (workers > thread_budget) {
+    stop("FORESTSTRUCTURE_CATALOG_WORKERS exceeds FORESTSTRUCTURE_THREADS")
+  }
+  workers
+}
+
+current_rss_bytes <- function() {
+  status <- tryCatch(
+    readLines("/proc/self/status", warn = FALSE),
+    error = function(error) character()
+  )
+  line <- grep("^VmRSS:", status, value = TRUE)
+  if (length(line) != 1L) return(0)
+  kib <- suppressWarnings(as.numeric(sub(
+    "^VmRSS:[[:space:]]*([0-9]+).*$",
+    "\\1",
+    line
+  )))
+  if (!is.finite(kib)) 0 else kib * 1024
+}
+
+assert_memory_budget <- function(required_bytes, parameters, operation,
+                                 single_segment = FALSE) {
+  budget_gib <- parameter_or(parameters, "memory_budget_gib", Inf)
+  if (!is.finite(budget_gib)) return(invisible(TRUE))
+  rss <- current_rss_bytes()
+  projected <- rss + max(0, required_bytes)
+  if (projected <= budget_gib * 1024^3) return(invisible(TRUE))
+  flag <- if (single_segment) {
+    "single_segment_exceeds_memory_budget"
+  } else {
+    "memory_budget_exceeded"
+  }
+  stop(sprintf(
+    paste0(
+      "FORESTSTRUCTURE_FLAG %s: %s requires an estimated %.3f GiB ",
+      "at %.3f GiB RSS with a %.3f GiB internal budget"
+    ),
+    flag,
+    operation,
+    required_bytes / 1024^3,
+    rss / 1024^3,
+    budget_gib
+  ))
+}
+
+assert_loaded_dimensions <- function(las, allowed, phase) {
+  present <- names(las@data)
+  unexpected <- setdiff(present, allowed)
+  missing <- setdiff(c("X", "Y", "Z"), present)
+  if (length(unexpected) > 0L || length(missing) > 0L) {
+    stop(sprintf(
+      paste0(
+        "FORESTSTRUCTURE_FLAG selective_read_violation: %s loaded [%s]; ",
+        "allowed [%s]"
+      ),
+      phase,
+      paste(present, collapse = ","),
+      paste(allowed, collapse = ",")
+    ))
+  }
+  invisible(TRUE)
+}
 
 configure_catalog_worker <- function() {
   lidR::set_lidr_threads(1L)
@@ -663,10 +761,17 @@ compute_edge_flags <- function(tiles, tile_size) {
 
 # Disk-backed DTM and CHM pipeline -----------------------------------------
 
-dtm_chunk <- function(chunk, dtm_resolution, ptd_resolution) {
+dtm_chunk <- function(chunk, dtm_resolution, ptd_resolution,
+                      point_order_dimension = NULL) {
   lidR::set_lidr_threads(1L)
   las <- readLAS(chunk)
   if (is.empty(las)) return(empty_chunk_raster(chunk, dtm_resolution))
+  assert_loaded_dimensions(
+    las,
+    c("X", "Y", "Z", "buffer", point_order_dimension),
+    "DTM"
+  )
+  las <- restore_original_point_order(las, point_order_dimension, "DTM")
   if (!las_has_nondegenerate_xy(las)) {
     message(
       "DTM chunk has fewer than three non-collinear input points; ",
@@ -674,9 +779,66 @@ dtm_chunk <- function(chunk, dtm_resolution, ptd_resolution) {
     )
     return(empty_chunk_raster(chunk, dtm_resolution))
   }
-  las <- classify_ground(las, ptd(res = ptd_resolution))
+  # Julia's DTM does not use return-number semantics. Being explicit avoids
+  # lidR changing behaviour when ReturnNumber happens to be present.
+  las <- classify_ground(
+    las,
+    ptd(res = ptd_resolution),
+    last_returns = FALSE
+  )
   surface <- classified_ground_surface(las, dtm_resolution)
   if (is.null(surface)) empty_chunk_raster(chunk, dtm_resolution) else surface
+}
+
+tin_compatible_xy_scale <- function(las) {
+  xscale <- as.numeric(las@header@PHB[["X scale factor"]])
+  yscale <- as.numeric(las@header@PHB[["Y scale factor"]])
+  if (any(!is.finite(c(xscale, yscale))) ||
+      any(c(xscale, yscale) <= 0)) {
+    stop("LAS header contains invalid XY scale factors")
+  }
+
+  maximum_coordinate <- max(
+    abs(las@data[["X"]]),
+    abs(las@data[["Y"]]),
+    na.rm = TRUE
+  )
+  if (!is.finite(maximum_coordinate)) {
+    stop("LAS chunk contains no finite XY coordinates")
+  }
+
+  # lidR's Delaunay implementation converts absolute XY coordinates to signed
+  # 32-bit integers. Select the smallest decimal LAS scale that keeps that
+  # conversion below 95% of the integer limit, then preserve any coarser input
+  # scale. Only this in-memory DTM copy is rescaled; source files are unchanged.
+  minimum_safe_scale <- maximum_coordinate /
+    (0.95 * .Machine$integer.max)
+  decimal_safe_scale <- if (minimum_safe_scale > 0) {
+    10^ceiling(log10(minimum_safe_scale))
+  } else {
+    max(xscale, yscale)
+  }
+  target_scale <- max(xscale, yscale, decimal_safe_scale)
+
+  if (isTRUE(all.equal(xscale, target_scale)) &&
+      isTRUE(all.equal(yscale, target_scale))) {
+    return(las)
+  }
+
+  message(sprintf(
+    paste(
+      "Rescaling in-memory DTM XY coordinates from %.12g/%.12g m to",
+      "%.12g m for lidR TIN integer compatibility; source data are unchanged"
+    ),
+    xscale,
+    yscale,
+    target_scale
+  ))
+  las_rescale(
+    las,
+    xscale = target_scale,
+    yscale = target_scale
+  )
 }
 
 las_has_nondegenerate_xy <- function(las) {
@@ -720,57 +882,6 @@ empty_chunk_raster <- function(chunk, resolution) {
   raster
 }
 
-tin_compatible_xy_scale <- function(las) {
-  xscale <- as.numeric(las@header@PHB[["X scale factor"]])
-  yscale <- as.numeric(las@header@PHB[["Y scale factor"]])
-  if (any(!is.finite(c(xscale, yscale))) ||
-      any(c(xscale, yscale) <= 0)) {
-    stop("LAS header contains invalid XY scale factors")
-  }
-
-  maximum_coordinate <- max(
-    abs(las@data[["X"]]),
-    abs(las@data[["Y"]]),
-    na.rm = TRUE
-  )
-  if (!is.finite(maximum_coordinate)) {
-    stop("LAS chunk contains no finite XY coordinates")
-  }
-
-  # lidR's Delaunay implementation converts absolute XY coordinates to signed
-  # 32-bit integers. Select the smallest decimal LAS scale that keeps that
-  # conversion below 95% of the integer limit, then preserve any coarser input
-  # scale. Typical LAS data already use 0.001 m and pass through unchanged.
-  minimum_safe_scale <- maximum_coordinate /
-    (0.95 * .Machine$integer.max)
-  decimal_safe_scale <- if (minimum_safe_scale > 0) {
-    10^ceiling(log10(minimum_safe_scale))
-  } else {
-    max(xscale, yscale)
-  }
-  target_scale <- max(xscale, yscale, decimal_safe_scale)
-
-  if (isTRUE(all.equal(xscale, target_scale)) &&
-      isTRUE(all.equal(yscale, target_scale))) {
-    return(las)
-  }
-
-  message(sprintf(
-    paste(
-      "Rescaling in-memory DTM XY coordinates from %.12g/%.12g m to",
-      "%.12g m for lidR TIN integer compatibility; source data are unchanged"
-    ),
-    xscale,
-    yscale,
-    target_scale
-  ))
-  las_rescale(
-    las,
-    xscale = target_scale,
-    yscale = target_scale
-  )
-}
-
 classified_ground_surface <- function(las, dtm_resolution) {
   classifications <- las[["Classification"]]
   if (is.null(classifications) || !any(classifications == 2L, na.rm = TRUE)) {
@@ -795,10 +906,24 @@ classified_ground_surface <- function(las, dtm_resolution) {
     )
     return(NULL)
   }
-  las <- tin_compatible_xy_scale(las)
   tryCatch(
     rasterize_terrain(las, res = dtm_resolution, algorithm = tin()),
     error = function(error) {
+      if (grepl(
+        "xy coordinates were not converted to integer",
+        conditionMessage(error),
+        fixed = TRUE
+      )) {
+        message(
+          "Retrying DTM TIN with an in-memory integer-compatible XY scale"
+        )
+        adjusted <- tin_compatible_xy_scale(las)
+        return(rasterize_terrain(
+          adjusted,
+          res = dtm_resolution,
+          algorithm = tin()
+        ))
+      }
       if (grepl(
         paste0(
           "cannot triangulate less than 3 points|No ground points found|",
@@ -874,7 +999,142 @@ virtual_raster_source <- function(result, label) {
   sources[[1]]
 }
 
-stream_virtual_raster <- function(result, output_path, label) {
+complete_chunk_raster_paths <- function(results, label) {
+  assert_catalog_completed(results, label)
+  paths <- unname(unlist(results, use.names = FALSE))
+  if (length(paths) == 0L || any(!file.exists(paths))) {
+    stop(sprintf(
+      "%s LAScatalog processing did not write every chunk raster",
+      label
+    ))
+  }
+
+  paths
+}
+
+populated_or_all_empty_chunk_raster_paths <- function(paths, label) {
+  has_data <- vapply(paths, function(path) {
+    count <- suppressWarnings(terra::global(terra::rast(path), "notNA"))
+    is.finite(count[[1L, 1L]]) && count[[1L, 1L]] > 0
+  }, logical(1))
+  if (any(has_data)) {
+    return(paths[has_data])
+  }
+
+  message(sprintf(
+    "global %s processing produced only empty chunks; publishing an all-NoData raster",
+    label
+  ))
+  paths
+}
+
+chunk_reference_crs <- function(paths, label) {
+  candidates <- vapply(paths, function(path) {
+    terra::crs(terra::rast(path))
+  }, character(1))
+  candidates <- unique(candidates[!is.na(candidates) & nzchar(candidates)])
+  if (length(candidates) > 1L) {
+    stop(sprintf("%s chunk rasters contain conflicting CRS metadata", label))
+  }
+  if (length(candidates) == 1L) candidates[[1L]] else NA_character_
+}
+
+spatial_reference_wkt <- function(value) {
+  reference <- sf::st_crs(value)
+  if (is.na(reference) || is.null(reference$wkt) ||
+      is.na(reference$wkt) || !nzchar(reference$wkt)) {
+    return(NA_character_)
+  }
+  reference$wkt
+}
+
+build_chunk_virtual_raster <- function(results, work_directory, label,
+                                       fallback_crs = NA_character_) {
+  all_paths <- complete_chunk_raster_paths(results, label)
+  reference_crs <- chunk_reference_crs(all_paths, label)
+  if ((is.na(reference_crs) || !nzchar(reference_crs)) &&
+      !is.na(fallback_crs) && nzchar(fallback_crs)) {
+    reference_crs <- fallback_crs
+  }
+  paths <- populated_or_all_empty_chunk_raster_paths(all_paths, label)
+  vrt_path <- file.path(
+    work_directory,
+    sprintf("%s_chunks.vrt", tolower(label))
+  )
+  input_list_path <- file.path(
+    work_directory,
+    sprintf("%s_chunks.txt", tolower(label))
+  )
+  unlink(vrt_path, force = TRUE)
+  writeLines(paths, input_list_path, useBytes = TRUE)
+  arguments <- c("-overwrite")
+  if (!is.na(reference_crs) && nzchar(reference_crs)) {
+    arguments <- c(arguments, "-a_srs", shQuote(reference_crs))
+  }
+  arguments <- c(
+    arguments,
+    "-input_file_list", shQuote(input_list_path),
+    shQuote(vrt_path)
+  )
+  status <- system2("gdalbuildvrt", arguments)
+  if (!identical(status, 0L) || !file.exists(vrt_path)) {
+    stop(sprintf("could not build the global %s chunk VRT", label))
+  }
+  result <- terra::rast(vrt_path)
+  if (!is.na(reference_crs) && nzchar(reference_crs)) {
+    actual_crs <- terra::crs(result)
+    if (is.na(actual_crs) || !nzchar(actual_crs)) {
+      stop(sprintf(
+        "global %s chunk VRT did not persist its reference CRS",
+        label
+      ))
+    }
+  }
+  result
+}
+
+gdal_raster_has_crs <- function(path) {
+  info <- system2(
+    "gdalinfo",
+    c("-json", shQuote(path)),
+    stdout = TRUE,
+    stderr = TRUE
+  )
+  status <- attr(info, "status")
+  if (!is.null(status) && status != 0L) {
+    stop(sprintf("could not inspect the global raster CRS for %s", path))
+  }
+  any(grepl('"coordinateSystem"', info, fixed = TRUE))
+}
+
+align_raster_file_crs <- function(path, source_crs, label) {
+  if (is.null(source_crs)) return(invisible(path))
+
+  source_has_crs <- !is.na(source_crs) && nzchar(source_crs)
+  definition <- if (source_has_crs) source_crs else "None"
+  status <- system2(
+    "gdal_edit.py",
+    c("-a_srs", shQuote(definition), shQuote(path))
+  )
+  if (!identical(status, 0L)) {
+    stop(sprintf(
+      "could not align the global %s raster CRS with the point-cloud source",
+      label
+    ))
+  }
+
+  output_has_crs <- gdal_raster_has_crs(path)
+  if (!identical(output_has_crs, source_has_crs)) {
+    stop(sprintf(
+      "global %s raster CRS does not match the point-cloud source state",
+      label
+    ))
+  }
+  invisible(path)
+}
+
+stream_virtual_raster <- function(result, output_path, label,
+                                  source_crs = NULL) {
   source_path <- virtual_raster_source(result, label)
   partial_path <- paste0(output_path, ".partial.tif")
   unlink(partial_path, force = TRUE)
@@ -899,6 +1159,7 @@ stream_virtual_raster <- function(result, output_path, label) {
   if (!file.rename(partial_path, output_path)) {
     stop(sprintf("could not atomically publish the global %s GeoTIFF", label))
   }
+  align_raster_file_crs(output_path, source_crs, label)
   invisible(output_path)
 }
 
@@ -922,6 +1183,45 @@ covering_grid_bounds <- function(bounds, resolution) {
   )
 }
 
+lidr_catalog_grid_bounds <- function(point_cloud, resolution) {
+  required_version <- "4.3.2"
+  actual_version <- as.character(utils::packageVersion("lidR"))
+  if (!identical(actual_version, required_version)) {
+    stop(sprintf(
+      paste0(
+        "Julia-faithful DTM layout requires pinned lidR %s; ",
+        "found %s"
+      ),
+      required_version,
+      actual_version
+    ))
+  }
+
+  # Julia's original rasterize_terrain() call delegates numeric-resolution
+  # geometry to this pinned lidR layout. In particular, it retains an extra
+  # cell when a LAS bound lies exactly on the grid alignment. Reusing the same
+  # implementation avoids approximating that half-cell rounding convention.
+  layout <- lidR:::raster_layout(
+    readLAScatalog(point_cloud),
+    resolution,
+    start = c(0, 0),
+    buffer = 0,
+    format = "template"
+  )
+  bounds <- c(
+    xmin = as.numeric(layout$xmin),
+    ymin = as.numeric(layout$ymin),
+    xmax = as.numeric(layout$xmax),
+    ymax = as.numeric(layout$ymax)
+  )
+  if (any(!is.finite(bounds)) ||
+      bounds[["xmax"]] <= bounds[["xmin"]] ||
+      bounds[["ymax"]] <= bounds[["ymin"]]) {
+    stop("pinned lidR returned an invalid Julia-faithful DTM layout")
+  }
+  bounds
+}
+
 raster_extent_covers_point_bounds <- function(raster_extent, point_bounds,
                                                resolution) {
   extent_values <- c(
@@ -942,10 +1242,30 @@ raster_extent_covers_point_bounds <- function(raster_extent, point_bounds,
 }
 
 cover_virtual_raster <- function(result, point_cloud, resolution,
-                                 work_directory, label) {
+                                 work_directory, label,
+                                 extent_mode = c("point_bounds", "lidr")) {
+  extent_mode <- match.arg(extent_mode)
   source_path <- virtual_raster_source(result, label)
   point_bounds <- point_cloud_xy_bounds(point_cloud)
-  target_bounds <- covering_grid_bounds(point_bounds, resolution)
+  target_bounds <- if (identical(extent_mode, "lidr")) {
+    lidr_catalog_grid_bounds(point_cloud, resolution)
+  } else {
+    covering_grid_bounds(point_bounds, resolution)
+  }
+  if (identical(extent_mode, "lidr") &&
+      !raster_extent_covers_point_bounds(
+        terra::ext(result),
+        target_bounds,
+        resolution
+      )) {
+    stop(sprintf(
+      paste0(
+        "global %s mosaic does not contain the complete pinned-lidR ",
+        "publication extent"
+      ),
+      label
+    ))
+  }
   covering_path <- file.path(
     work_directory,
     sprintf("%s_covering.vrt", tolower(label))
@@ -995,17 +1315,23 @@ cover_virtual_raster <- function(result, point_cloud, resolution,
 
 write_global_dtm <- function(point_cloud, output_path, work_directory,
                              chunk_size, dtm_buffer, dtm_resolution,
-                             ptd_resolution, workers) {
+                             ptd_resolution, workers, source_crs = NULL,
+                             point_order_dimension = NULL) {
   prepare_raster_work_directory(work_directory, "DTM")
   on.exit(unlink(work_directory, recursive = TRUE, force = TRUE), add = TRUE)
 
   catalog <- readLAScatalog(point_cloud)
   opt_chunk_size(catalog) <- chunk_size
   opt_chunk_buffer(catalog) <- dtm_buffer
-  opt_select(catalog) <- DTM_CATALOG_SELECTION
+  opt_select(catalog) <- catalog_selection_for_dimensions(
+    point_cloud,
+    point_order_dimension,
+    DTM_CATALOG_SELECTION
+  )
   opt_progress(catalog) <- FALSE
   opt_output_files(catalog) <- file.path(work_directory, "dtm_{ID}")
   catalog@output_options$drivers$SpatRaster$param$datatype <- "FLT8S"
+  if (is.null(source_crs)) source_crs <- spatial_reference_wkt(catalog)
 
   results <- with_catalog_workers(
     workers,
@@ -1015,6 +1341,7 @@ write_global_dtm <- function(point_cloud, output_path, work_directory,
       dtm_chunk,
       dtm_resolution = dtm_resolution,
       ptd_resolution = ptd_resolution,
+      point_order_dimension = point_order_dimension,
       .options = list(
         automerge = FALSE,
         drop_null = FALSE,
@@ -1022,15 +1349,29 @@ write_global_dtm <- function(point_cloud, output_path, work_directory,
       )
     )
   )
-  assert_catalog_completed(results, "DTM")
-
-  chunk_paths <- list.files(
+  chunk_paths <- complete_chunk_raster_paths(results, "DTM")
+  mosaic <- build_dtm_overlap_mosaic(
+    chunk_paths,
     work_directory,
-    pattern = "^dtm_.+\\.tif$",
-    full.names = TRUE
+    fallback_crs = source_crs
   )
-  if (length(chunk_paths) == 0L) {
-    stop("global DTM processing produced no disk-backed chunk rasters")
+  covering <- cover_virtual_raster(
+    mosaic,
+    point_cloud,
+    dtm_resolution,
+    work_directory,
+    "DTM",
+    extent_mode = "lidr"
+  )
+  stream_virtual_raster(covering, output_path, "DTM", source_crs)
+}
+
+build_dtm_overlap_mosaic <- function(chunk_paths, work_directory,
+                                     fallback_crs = NA_character_) {
+  reference_crs <- chunk_reference_crs(chunk_paths, "DTM")
+  if ((is.na(reference_crs) || !nzchar(reference_crs)) &&
+      !is.na(fallback_crs) && nzchar(fallback_crs)) {
+    reference_crs <- fallback_crs
   }
   mosaic_path <- file.path(work_directory, "dtm_mosaic.tif")
   mosaic <- terra::mosaic(
@@ -1047,28 +1388,38 @@ write_global_dtm <- function(point_cloud, output_path, work_directory,
   }
 
   mosaic_vrt_path <- file.path(work_directory, "dtm_mosaic.vrt")
+  arguments <- c("-overwrite")
+  if (!is.na(reference_crs) && nzchar(reference_crs)) {
+    arguments <- c(arguments, "-a_srs", shQuote(reference_crs))
+  }
+  arguments <- c(
+    arguments,
+    shQuote(mosaic_vrt_path),
+    shQuote(mosaic_path)
+  )
   status <- system2(
     "gdalbuildvrt",
-    c(shQuote(mosaic_vrt_path), shQuote(mosaic_path))
+    arguments
   )
   if (!identical(status, 0L) || !file.exists(mosaic_vrt_path)) {
     stop("could not create the global DTM publication VRT")
   }
-  covering <- cover_virtual_raster(
-    terra::rast(mosaic_vrt_path),
-    point_cloud,
-    dtm_resolution,
-    work_directory,
-    "DTM"
-  )
-  stream_virtual_raster(covering, output_path, "DTM")
+  result <- terra::rast(mosaic_vrt_path)
+  if (!is.na(reference_crs) && nzchar(reference_crs)) {
+    actual_crs <- terra::crs(result)
+    if (is.na(actual_crs) || !nzchar(actual_crs)) {
+      stop("global DTM publication VRT did not persist its reference CRS")
+    }
+  }
+  result
 }
 
 chm_chunk <- function(chunk, dtm_path, voxel_resolution, maximum_height,
-                      chm_resolution) {
+                      chm_resolution, point_order_dimension = NULL) {
   lidR::set_lidr_threads(1L)
   las <- readLAS(chunk)
   if (is.empty(las)) return(empty_chunk_raster(chunk, chm_resolution))
+  las <- restore_original_point_order(las, point_order_dimension, "CHM")
   las <- normalize_height(las, terra::rast(dtm_path))
   las <- filter_poi(las, is.finite(Z) & Z >= 0 & Z <= maximum_height)
   if (is.empty(las)) return(empty_chunk_raster(chunk, chm_resolution))
@@ -1079,16 +1430,22 @@ chm_chunk <- function(chunk, dtm_path, voxel_resolution, maximum_height,
 
 write_global_chm <- function(point_cloud, dtm_path, output_path, work_directory,
                              chunk_size, voxel_resolution, maximum_height,
-                             chm_resolution, workers) {
+                             chm_resolution, workers, source_crs = NULL,
+                             point_order_dimension = NULL) {
   prepare_raster_work_directory(work_directory, "CHM")
   on.exit(unlink(work_directory, recursive = TRUE, force = TRUE), add = TRUE)
 
   catalog <- readLAScatalog(point_cloud)
   opt_chunk_size(catalog) <- chunk_size
   opt_chunk_buffer(catalog) <- 0
-  opt_select(catalog) <- "xyz"
+  opt_select(catalog) <- catalog_selection_for_dimensions(
+    point_cloud,
+    point_order_dimension,
+    "xyz"
+  )
   opt_progress(catalog) <- FALSE
   opt_output_files(catalog) <- file.path(work_directory, "chm_{ID}")
+  if (is.null(source_crs)) source_crs <- spatial_reference_wkt(catalog)
 
   results <- with_catalog_workers(
     workers,
@@ -1100,6 +1457,7 @@ write_global_chm <- function(point_cloud, dtm_path, output_path, work_directory,
       voxel_resolution = voxel_resolution,
       maximum_height = maximum_height,
       chm_resolution = chm_resolution,
+      point_order_dimension = point_order_dimension,
       .options = list(
         automerge = FALSE,
         drop_null = FALSE,
@@ -1107,8 +1465,12 @@ write_global_chm <- function(point_cloud, dtm_path, output_path, work_directory,
       )
     )
   )
-  assert_catalog_completed(results, "CHM")
-  result <- terra::vrt(unlist(results, use.names = FALSE))
+  result <- build_chunk_virtual_raster(
+    results,
+    work_directory,
+    "CHM",
+    source_crs
+  )
   covering <- cover_virtual_raster(
     result,
     point_cloud,
@@ -1116,7 +1478,7 @@ write_global_chm <- function(point_cloud, dtm_path, output_path, work_directory,
     work_directory,
     "CHM"
   )
-  stream_virtual_raster(covering, output_path, "CHM")
+  stream_virtual_raster(covering, output_path, "CHM", source_crs)
 }
 
 # Memory-bounded global segment aggregation --------------------------------
@@ -1135,31 +1497,63 @@ select_instance_dimensions <- function(point_cloud, candidates) {
   unique(candidates[candidates %in% available])
 }
 
-segment_catalog_selection <- function(point_cloud, instance_dimensions) {
+segment_catalog_selection <- function(point_cloud, instance_dimensions,
+                                      base_selection = SEGMENT_CATALOG_BASE_SELECTION) {
   header <- readLASheader(point_cloud)
   extra_bytes <- header@VLR$Extra_Bytes[["Extra Bytes Description"]]
   if (is.null(extra_bytes) || length(extra_bytes) == 0) {
-    return(SEGMENT_CATALOG_BASE_SELECTION)
+    return(base_selection)
   }
   available <- vapply(extra_bytes, function(description) {
     as.character(description$name)
   }, character(1))
-  segment_selection_from_names(available, instance_dimensions)
+  segment_selection_from_names(available, instance_dimensions, base_selection)
 }
 
-segment_selection_from_names <- function(available, instance_dimensions) {
+catalog_selection_for_dimensions <- function(point_cloud, dimensions,
+                                             base_selection = "xyz") {
+  dimensions <- dimensions[!is.na(dimensions) & nzchar(dimensions)]
+  if (length(dimensions) == 0L) return(base_selection)
+  header <- readLASheader(point_cloud)
+  extra_bytes <- header@VLR$Extra_Bytes[["Extra Bytes Description"]]
+  if (is.null(extra_bytes) || length(extra_bytes) == 0L) {
+    stop("requested catalog ExtraByte dimensions are absent")
+  }
+  available <- vapply(extra_bytes, function(description) {
+    as.character(description$name)
+  }, character(1))
+  missing <- setdiff(dimensions, available)
+  if (length(missing) > 0L) {
+    stop(sprintf(
+      "catalog is missing required ExtraByte dimension(s): %s",
+      paste(missing, collapse = ", ")
+    ))
+  }
+  positions <- unique(match(dimensions, available))
+  if (any(positions > 9L)) return(paste0(base_selection, "0"))
+  paste0(base_selection, paste(positions, collapse = ""))
+}
+
+segment_selection_from_names <- function(available, instance_dimensions,
+                                         base_selection = SEGMENT_CATALOG_BASE_SELECTION) {
   positions <- unique(match(instance_dimensions, available))
   positions <- positions[!is.na(positions)]
-  if (length(positions) == 0) return(SEGMENT_CATALOG_BASE_SELECTION)
+  if (length(positions) == 0) return(base_selection)
 
   # lidR exposes individual ExtraBytes selectors only for positions 1-9.
   # Position 0 requests all ExtraBytes while still excluding unrelated
   # standard LAS attributes. This fallback preserves dimensions beyond the
   # ninth ExtraBytes field without returning to the all-attribute wildcard.
   if (any(positions > 9L)) {
-    return(paste0(SEGMENT_CATALOG_BASE_SELECTION, "0"))
+    if (identical(base_selection, JULIA_MEMORY_SAFE_SEGMENT_SELECTION)) {
+      stop(
+        "Julia-memory-safe selection requires a verified streaming ",
+        "projection for ExtraByte positions beyond nine"
+      )
+    }
+    return(paste0(base_selection, "0"))
   }
-  paste0(SEGMENT_CATALOG_BASE_SELECTION, paste(positions, collapse = ""))
+  paste0(base_selection, paste(positions, collapse = ""))
 }
 
 segment_bucket <- function(instance_id, bucket_count) {
@@ -1199,12 +1593,29 @@ write_segment_chunk_store <- function(voxels, layers, apex, work_directory,
 }
 
 segment_chunk <- function(chunk, dtm_path, voxel_resolution, maximum_height,
-                          instance_dimensions, work_directory, bucket_count) {
+                          instance_dimensions, work_directory, bucket_count,
+                          strict_dimensions = FALSE,
+                          point_order_dimension = NULL) {
   configure_catalog_worker()
   las <- readLAS(chunk)
   if (is.empty(las)) {
     if (!chunk_has_valid_extent(chunk)) return(NULL)
     return(list(paths = NULL))
+  }
+  las <- restore_original_point_order(
+    las,
+    point_order_dimension,
+    "segment"
+  )
+  if (isTRUE(strict_dimensions)) {
+    assert_loaded_dimensions(
+      las,
+      c(
+        "X", "Y", "Z", "buffer", instance_dimensions,
+        point_order_dimension
+      ),
+      "segment"
+    )
   }
   selected <- instance_dimensions[instance_dimensions %in% names(las@data)]
   if (length(selected) == 0) return(list(paths = NULL))
@@ -1254,12 +1665,18 @@ segment_chunk <- function(chunk, dtm_path, voxel_resolution, maximum_height,
 accumulate_segments <- function(point_cloud, dtm_path, chunk_size,
                                 voxel_resolution, maximum_height,
                                 instance_dimensions, workers, work_directory,
-                                bucket_count = SEGMENT_BUCKET_COUNT) {
+                                bucket_count = SEGMENT_BUCKET_COUNT,
+                                base_selection = SEGMENT_CATALOG_BASE_SELECTION,
+                                point_order_dimension = NULL) {
   prepare_raster_work_directory(work_directory, "segment")
   catalog <- readLAScatalog(point_cloud)
   opt_chunk_size(catalog) <- chunk_size
   opt_chunk_buffer(catalog) <- 0
-  selection <- segment_catalog_selection(point_cloud, instance_dimensions)
+  selection <- segment_catalog_selection(
+    point_cloud,
+    c(instance_dimensions, point_order_dimension),
+    base_selection
+  )
   opt_select(catalog) <- selection
   opt_progress(catalog) <- FALSE
   message(sprintf(
@@ -1278,6 +1695,11 @@ accumulate_segments <- function(point_cloud, dtm_path, chunk_size,
       instance_dimensions = instance_dimensions,
       work_directory = work_directory,
       bucket_count = bucket_count,
+      strict_dimensions = identical(
+        base_selection,
+        JULIA_MEMORY_SAFE_SEGMENT_SELECTION
+      ),
+      point_order_dimension = point_order_dimension,
       .options = list(automerge = FALSE, drop_null = FALSE)
     )
   )
@@ -1307,6 +1729,7 @@ finalize_segments <- function(accumulated, parameters) {
     if (.N < 3) {
       .(pca_extent_1 = NA_real_, pca_extent_2 = NA_real_, pca_extent_3 = NA_real_)
     } else {
+      assert_memory_budget(.N * 3 * 8 * 6, parameters, "segment PCA", TRUE)
       coordinates <- as.matrix(.SD) * parameters$voxel_resolution
       extents <- tryCatch({
         rotated <- prcomp(coordinates, center = TRUE)$x
@@ -1342,7 +1765,134 @@ finalize_segments <- function(accumulated, parameters) {
   segments
 }
 
-finalize_segment_store <- function(store, parameters) {
+segment_partition_estimate <- function(paths) {
+  sizes <- file.info(paths)$size
+  sizes[!is.finite(sizes)] <- 0
+  # Uncompressed RDS expands into list/data.table objects and is copied by
+  # rbindlist(), unique(), and PCA preparation. Splitting more often is safe.
+  sum(sizes) * 8
+}
+
+load_segment_partition <- function(paths, parameters) {
+  assert_memory_budget(
+    segment_partition_estimate(paths),
+    parameters,
+    "segment partition aggregation"
+  )
+  pieces <- lapply(paths, readRDS)
+  voxels <- unique(rbindlist(lapply(pieces, function(piece) piece[["voxels"]])))
+  layers <- unique(rbindlist(lapply(pieces, function(piece) piece[["layers"]])))
+  apex <- rbindlist(lapply(pieces, function(piece) piece[["apex"]]))
+  apex <- apex[
+    apex[, .I[which.max(apex_z)],
+      by = c("instance_dimension", "instance_id")]$V1
+  ]
+  result <- finalize_segments(
+    list(voxels = voxels, layers = layers, apex = apex),
+    parameters
+  )
+  rm(pieces, voxels, layers, apex)
+  gc(verbose = FALSE)
+  result
+}
+
+split_segment_partition <- function(paths, work_directory, depth, parameters) {
+  children <- list(character(), character())
+  keys <- character()
+  divisor <- SEGMENT_BUCKET_COUNT * 2^depth
+  for (path in paths) {
+    assert_memory_budget(
+      file.info(path)$size * 8,
+      parameters,
+      "one segment chunk summary"
+    )
+    piece <- readRDS(path)
+    piece_keys <- unique(rbindlist(lapply(piece, function(values) {
+      values[, .(instance_dimension, instance_id)]
+    }), use.names = TRUE))
+    keys <- unique(c(
+      keys,
+      paste(piece_keys$instance_dimension, piece_keys$instance_id)
+    ))
+    for (branch in 0:1) {
+      subset_piece <- lapply(piece, function(values) {
+        values[(floor(abs(as.numeric(instance_id)) / divisor) %% 2) == branch]
+      })
+      if (!any(vapply(subset_piece, nrow, integer(1)) > 0L)) next
+      child_path <- tempfile(
+        pattern = sprintf("segment_split_%02d_%d_", depth, branch),
+        tmpdir = work_directory,
+        fileext = ".rds"
+      )
+      saveRDS(subset_piece, child_path, compress = FALSE)
+      children[[branch + 1L]] <- c(children[[branch + 1L]], child_path)
+    }
+    rm(piece, piece_keys)
+    gc(verbose = FALSE)
+  }
+  list(paths = Filter(length, children), unique_keys = length(keys))
+}
+
+finalize_segment_partition <- function(paths, parameters, depth = 0L) {
+  budget_gib <- parameter_or(parameters, "memory_budget_gib", Inf)
+  estimate <- segment_partition_estimate(paths)
+  if (!is.finite(budget_gib) ||
+      current_rss_bytes() + estimate <= budget_gib * 1024^3) {
+    return(load_segment_partition(paths, parameters))
+  }
+
+  split <- split_segment_partition(
+    paths,
+    dirname(paths[[1]]),
+    depth,
+    parameters
+  )
+  child_paths <- unlist(split$paths, use.names = FALSE)
+  on.exit(unlink(child_paths, force = TRUE), add = TRUE)
+  if (split$unique_keys <= 1L || depth >= 52L) {
+    assert_memory_budget(
+      estimate,
+      parameters,
+      "one complete segment",
+      single_segment = TRUE
+    )
+  }
+  message(sprintf(
+    "Splitting oversized segment partition at depth %d into %d child partition(s)",
+    depth + 1L,
+    length(split$paths)
+  ))
+  results <- lapply(split$paths, function(child) {
+    finalize_segment_partition(child, parameters, depth + 1L)
+  })
+  rbindlist(results, use.names = TRUE)
+}
+
+finalize_segment_store_in_memory <- function(store, parameters) {
+  paths <- unlist(store$chunks, use.names = FALSE)
+  if (length(paths) == 0L) return(NULL)
+  pieces <- lapply(paths, readRDS)
+  voxels <- unique(rbindlist(lapply(pieces, function(piece) piece[["voxels"]])))
+  layers <- unique(rbindlist(lapply(pieces, function(piece) piece[["layers"]])))
+  apex <- rbindlist(lapply(pieces, function(piece) piece[["apex"]]))
+  apex <- apex[
+    apex[, .I[which.max(apex_z)],
+      by = c("instance_dimension", "instance_id")]$V1
+  ]
+  segments <- finalize_segments(
+    list(voxels = voxels, layers = layers, apex = apex),
+    parameters
+  )
+  setkeyv(segments, c("instance_dimension", "instance_id"))
+  segments
+}
+
+finalize_segment_store <- function(store, parameters,
+                                   adapter = c("disk", "memory")) {
+  adapter <- match.arg(adapter)
+  if (identical(adapter, "memory")) {
+    return(finalize_segment_store_in_memory(store, parameters))
+  }
   previous_threads <- data.table::getDTthreads()
   on.exit(data.table::setDTthreads(previous_threads), add = TRUE)
   data.table::setDTthreads(DATA_TABLE_THREADS)
@@ -1354,25 +1904,13 @@ finalize_segment_store <- function(store, parameters) {
     }), use.names = FALSE)
     if (length(paths) == 0) next
 
-    pieces <- lapply(paths, readRDS)
-    voxels <- unique(rbindlist(lapply(pieces, `[[`, "voxels")))
-    layers <- unique(rbindlist(lapply(pieces, `[[`, "layers")))
-    apex <- rbindlist(lapply(pieces, `[[`, "apex"))
-    apex <- apex[
-      apex[, .I[which.max(apex_z)],
-        by = c("instance_dimension", "instance_id")]$V1
-    ]
-    finalized[[bucket_index]] <- finalize_segments(
-      list(voxels = voxels, layers = layers, apex = apex),
-      parameters
-    )
-    rm(pieces, voxels, layers, apex)
+    finalized[[bucket_index]] <- finalize_segment_partition(paths, parameters)
     gc(verbose = FALSE)
   }
   finalized <- Filter(Negate(is.null), finalized)
   if (length(finalized) == 0) return(NULL)
   segments <- rbindlist(finalized, use.names = TRUE)
-  setorderv(segments, c("instance_dimension", "instance_id"))
+  setkeyv(segments, c("instance_dimension", "instance_id"))
   segments
 }
 
@@ -1493,13 +2031,15 @@ write_upstream_csv <- function(values, path) {
   invisible(path)
 }
 
-write_segment_diagnostics <- function(segments, point_cloud, path) {
+write_segment_diagnostics <- function(segments, point_cloud, path,
+                                      sensor = NA_character_,
+                                      country = NA_character_) {
   diagnostics <- empty_segment_diagnostics()
   if (!is.null(segments) && nrow(segments) > 0) {
     diagnostics <- segments[, .(
       file = basename(point_cloud),
-      sensor = NA_character_,
-      country = NA_character_,
+      sensor = sensor,
+      country = country,
       tile_id,
       PredInstance = instance_id,
       n_vox,
@@ -1555,13 +2095,27 @@ calculate_tile_metrics <- function(point_cloud, tile, dtm, parameters) {
 
   las <- readLAS(
     point_cloud,
-    select = "xyz",
+    select = catalog_selection_for_dimensions(
+      point_cloud,
+      parameters$point_order_dimension,
+      "xyz"
+    ),
     filter = sprintf(
       "-inside %.10f %.10f %.10f %.10f",
       bounds[["xmin"]], bounds[["ymin"]], bounds[["xmax"]], bounds[["ymax"]]
     )
   )
   if (is.empty(las)) return(empty)
+  assert_loaded_dimensions(
+    las,
+    c("X", "Y", "Z", parameters$point_order_dimension),
+    "tile"
+  )
+  las <- restore_original_point_order(
+    las,
+    parameters$point_order_dimension,
+    "tile"
+  )
 
   las <- normalize_height(las, dtm)
   las <- filter_poi(las, is.finite(Z) & Z >= 0 & Z <= parameters$maximum_height)
@@ -1658,12 +2212,13 @@ calculate_tile_metrics <- function(point_cloud, tile, dtm, parameters) {
 }
 
 build_tile_row <- function(point_cloud_name, tile, edge_tile, tile_count,
-                           metrics, tree_metrics) {
+                           metrics, tree_metrics, sensor = NA_character_,
+                           country = NA_character_) {
   bounds <- st_bbox(tile)
   as.data.table(c(list(
     file = point_cloud_name,
-    sensor = NA_character_,
-    country = NA_character_,
+    sensor = sensor,
+    country = country,
     tile_id = tile$tile_id[[1]],
     tile_xmin = as.numeric(bounds[["xmin"]]),
     tile_ymin = as.numeric(bounds[["ymin"]]),
@@ -1711,18 +2266,21 @@ empty_result_table <- function() {
   )
 }
 
-apply_output_crs <- function(geometry, dtm) {
-  raster_crs <- terra::crs(dtm)
-  if (nzchar(raster_crs)) st_crs(geometry) <- st_crs(raster_crs)
+apply_output_crs <- function(geometry, source_crs) {
+  if (is.null(source_crs) || is.na(source_crs) || !nzchar(source_crs)) {
+    st_crs(geometry) <- NA
+  } else {
+    st_crs(geometry) <- st_crs(source_crs)
+  }
   geometry
 }
 
-write_tile_geojson <- function(tiles, result, dtm, path) {
+write_tile_geojson <- function(tiles, result, source_crs, path) {
   if (nrow(tiles) == 0) {
     writeLines('{"type":"FeatureCollection","features":[]}', path, useBytes = TRUE)
     return(invisible(path))
   }
-  output <- apply_output_crs(tiles, dtm)
+  output <- apply_output_crs(tiles, source_crs)
   attributes <- as.data.frame(result)
   for (name in setdiff(names(attributes), "tile_id")) {
     output[[name]] <- attributes[[name]]
@@ -1837,6 +2395,33 @@ peak_rss_mib <- function() {
   as.numeric(gsub("[^0-9]", "", line[[1]])) / 1024
 }
 
+cgroup_memory_peak_mib <- function() {
+  candidates <- c(
+    "/sys/fs/cgroup/memory.peak",
+    "/sys/fs/cgroup/memory/memory.max_usage_in_bytes"
+  )
+  path <- candidates[file.exists(candidates)][1]
+  if (is.na(path)) return(NA_real_)
+  value <- suppressWarnings(as.numeric(readLines(path, n = 1L, warn = FALSE)))
+  if (!is.finite(value)) NA_real_ else value / 1024^2
+}
+
+temporary_directory_bytes <- function(path) {
+  if (!dir.exists(path)) return(0)
+  paths <- list.files(
+    path,
+    recursive = TRUE,
+    full.names = TRUE,
+    all.files = TRUE,
+    no.. = TRUE
+  )
+  if (length(paths) == 0L) return(0)
+  # The staged source cloud is a symlink and is not temporary disk usage.
+  paths <- paths[!nzchar(Sys.readlink(paths))]
+  sizes <- file.info(paths)$size
+  sum(sizes[is.finite(sizes)], na.rm = TRUE)
+}
+
 write_performance_report <- function(parameters, footprint_source, point_count, tile_count,
                                      instance_dimensions, catalog_workers,
                                      timings, path) {
@@ -1854,6 +2439,8 @@ write_performance_report <- function(parameters, footprint_source, point_count, 
     threads_effective = get_lidr_threads(),
     catalog_workers = catalog_workers,
     peak_rss_mib = round(peak_rss_mib(), 3),
+    cgroup_memory_peak_mib = round(cgroup_memory_peak_mib(), 3),
+    temporary_disk_peak_mib = round(timings$temporary_disk_peak_mib, 3),
     grid_seconds = round(timings$grid, 6),
     dtm_seconds = round(timings$dtm, 6),
     chm_seconds = round(timings$chm, 6),
@@ -1879,27 +2466,77 @@ write_performance_report <- function(parameters, footprint_source, point_count, 
     dtm_buffer = parameters$dtm_buffer,
     dtm_storage_mode = "disk_backed_vrt",
     chm_storage_mode = "disk_backed_vrt",
+    execution_mode = if (isTRUE(parameters$sequential_instance_dimensions)) {
+      "julia_memory_safe"
+    } else {
+      "default"
+    },
+    internal_memory_budget_gib = parameters$memory_budget_gib,
+    segment_catalog_base_selection =
+      parameters$segment_catalog_base_selection,
     instance_dimension_candidates = paste(parameters$instance_dimension, collapse = "|")
   )
   fwrite(report, path, na = "NA")
   message(sprintf(
-    "PERF total=%.3fs grid=%.3fs dtm=%.3fs chm=%.3fs segments=%.3fs tiles=%.3fs outputs=%.3fs peak_rss=%.1fMiB",
+    paste0(
+      "PERF total=%.3fs grid=%.3fs dtm=%.3fs chm=%.3fs ",
+      "segments=%.3fs tiles=%.3fs outputs=%.3fs peak_rss=%.1fMiB ",
+      "cgroup_peak=%.1fMiB"
+    ),
     timings$total, timings$grid, timings$dtm, timings$chm, timings$segments,
-    timings$tiles, timings$outputs, report$peak_rss_mib[[1]]
+    timings$tiles, timings$outputs, report$peak_rss_mib[[1]],
+    report$cgroup_memory_peak_mib[[1]]
   ))
   invisible(path)
 }
 
-main <- function() {
+run_analysis <- function(parameters) {
+  parameters$sensor <- parameter_or(parameters, "sensor", NA_character_)
+  parameters$country <- parameter_or(parameters, "country", NA_character_)
+  parameters$memory_budget_gib <- parameter_or(
+    parameters, "memory_budget_gib", Inf
+  )
+  parameters$sequential_instance_dimensions <- parameter_or(
+    parameters, "sequential_instance_dimensions", FALSE
+  )
+  parameters$segment_catalog_base_selection <- parameter_or(
+    parameters,
+    "segment_catalog_base_selection",
+    SEGMENT_CATALOG_BASE_SELECTION
+  )
+  parameters$segment_bucket_count <- parameter_or(
+    parameters,
+    "segment_bucket_count",
+    SEGMENT_BUCKET_COUNT
+  )
+  parameters$dimension_point_clouds <- parameter_or(
+    parameters, "dimension_point_clouds", list()
+  )
+  parameters$point_order_dimension <- parameter_or(
+    parameters, "point_order_dimension", NULL
+  )
+  parameters$point_cloud_display_name <- parameter_or(
+    parameters,
+    "point_cloud_display_name",
+    basename(parameters$point_cloud)
+  )
+  work_root <- parameter_or(parameters, "temp_dir", parameters$output_dir)
+  if (!dir.exists(work_root) || file.access(work_root, mode = 2) != 0) {
+    stop("analysis temporary directory must exist and be writable")
+  }
+  run_work_directory <- file.path(
+    work_root,
+    sprintf(".%s_forest_structure_%d", parameters$dataset_id, Sys.getpid())
+  )
+  dir.create(run_work_directory, recursive = TRUE, showWarnings = FALSE)
+  temporary_disk_peak_bytes <- temporary_directory_bytes(run_work_directory)
+  on.exit(unlink(run_work_directory, recursive = TRUE, force = TRUE), add = TRUE)
   total_started <- proc.time()[["elapsed"]]
-  parameters <- parse_parameters()
   point_count <- point_count_from_las_header(parameters$point_cloud)
   assert_lidr_point_count_supported(point_count)
+  source_crs <- spatial_reference_wkt(readLAScatalog(parameters$point_cloud))
   paths <- artifact_paths(parameters$output_dir, parameters$dataset_id)
-  segment_work_directory <- file.path(
-    parameters$output_dir,
-    sprintf(".%s_forest_structure_segment_chunks", parameters$dataset_id)
-  )
+  segment_work_directory <- file.path(run_work_directory, "segment_chunks")
   on.exit(
     unlink(segment_work_directory, recursive = TRUE, force = TRUE),
     add = TRUE
@@ -1925,6 +2562,7 @@ main <- function() {
     catalog_workers,
     thread_budget
   ))
+  message("FORESTSTRUCTURE_STAGE stage=grid status=started")
   grid_started <- proc.time()[["elapsed"]]
   aoi <- read_analysis_footprint(parameters$point_cloud, parameters$aoi)
   if (identical(aoi$source, "point_cloud_extent")) {
@@ -1940,52 +2578,64 @@ main <- function() {
   )
   grid_seconds <- elapsed_seconds(grid_started)
   message(sprintf("Optimized grid contains %d complete Analysis Tiles", nrow(tiles)))
+  message("FORESTSTRUCTURE_STAGE stage=grid status=completed")
 
+  message("FORESTSTRUCTURE_STAGE stage=dtm status=started")
   dtm_started <- proc.time()[["elapsed"]]
   dtm_path <- paths$dtm
   write_global_dtm(
     parameters$point_cloud,
     dtm_path,
-    file.path(
-      parameters$output_dir,
-      sprintf(".%s_forest_structure_dtm_chunks", parameters$dataset_id)
-    ),
+    file.path(run_work_directory, "dtm_chunks"),
     parameters$dtm_chunk_size,
     parameters$dtm_buffer,
     parameters$dtm_resolution,
     parameters$ptd_resolution,
-    catalog_workers
+    catalog_workers,
+    source_crs,
+    parameters$point_order_dimension
   )
   dtm <- terra::rast(dtm_path)
   if (terra::inMemory(dtm)) {
     stop("published DTM unexpectedly materialized in memory")
   }
   dtm_seconds <- elapsed_seconds(dtm_started)
+  temporary_disk_peak_bytes <- max(
+    temporary_disk_peak_bytes,
+    temporary_directory_bytes(run_work_directory)
+  )
+  message("FORESTSTRUCTURE_STAGE stage=dtm status=completed")
 
+  message("FORESTSTRUCTURE_STAGE stage=chm status=started")
   chm_started <- proc.time()[["elapsed"]]
   chm_path <- paths$chm
   write_global_chm(
     parameters$point_cloud,
     dtm_path,
     chm_path,
-    file.path(
-      parameters$output_dir,
-      sprintf(".%s_forest_structure_chm_chunks", parameters$dataset_id)
-    ),
+    file.path(run_work_directory, "chm_chunks"),
     parameters$chunk_size,
     parameters$voxel_resolution,
     parameters$maximum_height,
     parameters$chm_resolution,
-    catalog_workers
+    catalog_workers,
+    source_crs,
+    parameters$point_order_dimension
   )
   chm_seconds <- elapsed_seconds(chm_started)
+  temporary_disk_peak_bytes <- max(
+    temporary_disk_peak_bytes,
+    temporary_directory_bytes(run_work_directory)
+  )
+  message("FORESTSTRUCTURE_STAGE stage=chm status=completed")
 
+  message("FORESTSTRUCTURE_STAGE stage=segmentation status=started")
   segment_started <- proc.time()[["elapsed"]]
   instance_dimensions <- select_instance_dimensions(
     parameters$point_cloud,
     parameters$instance_dimension
   )
-  segments <- NULL
+  segments_by_dimension <- list()
   if (length(instance_dimensions) == 0) {
     message("No configured Instance Dimensions found; tree and segment metrics will be NA")
   } else {
@@ -1993,35 +2643,108 @@ main <- function() {
       "Using Instance Dimensions: %s",
       paste(instance_dimensions, collapse = ", ")
     ))
-    accumulated <- accumulate_segments(
-      parameters$point_cloud,
-      dtm_path,
-      parameters$chunk_size,
-      parameters$voxel_resolution,
-      parameters$maximum_height,
-      instance_dimensions,
-      catalog_workers,
-      segment_work_directory
-    )
-    if (!is.null(accumulated)) {
-      segments <- assign_segments_to_tiles(
-        finalize_segment_store(accumulated, parameters),
-        tiles
+    if (isTRUE(parameters$sequential_instance_dimensions)) {
+      for (instance_dimension in instance_dimensions) {
+        dimension_source <- parameters$dimension_point_clouds[[instance_dimension]]
+        if (is.null(dimension_source)) dimension_source <- parameters$point_cloud
+        dimension_directory <- file.path(
+          segment_work_directory,
+          gsub("[^A-Za-z0-9_-]", "_", instance_dimension)
+        )
+        message(sprintf(
+          "Starting independent segment pass for %s from %s",
+          instance_dimension,
+          basename(dimension_source)
+        ))
+        accumulated <- accumulate_segments(
+          dimension_source,
+          dtm_path,
+          parameters$chunk_size,
+          parameters$voxel_resolution,
+          parameters$maximum_height,
+          instance_dimension,
+          catalog_workers,
+          dimension_directory,
+          bucket_count = parameters$segment_bucket_count,
+          base_selection = parameters$segment_catalog_base_selection,
+          point_order_dimension = parameters$point_order_dimension
+        )
+        dimension_segments <- if (is.null(accumulated)) {
+          NULL
+        } else {
+          assign_segments_to_tiles(
+            finalize_segment_store(accumulated, parameters),
+            tiles
+          )
+        }
+        segments_by_dimension[instance_dimension] <- list(dimension_segments)
+        if (!is.null(dimension_segments)) {
+          message(sprintf(
+            "Segment pass %s found %d segments (%d accepted trees)",
+            instance_dimension,
+            nrow(dimension_segments),
+            sum(dimension_segments$is_tree, na.rm = TRUE)
+          ))
+        }
+        temporary_disk_peak_bytes <- max(
+          temporary_disk_peak_bytes,
+          temporary_directory_bytes(run_work_directory)
+        )
+        rm(accumulated)
+        unlink(dimension_directory, recursive = TRUE, force = TRUE)
+        gc(verbose = FALSE)
+      }
+    } else {
+      accumulated <- accumulate_segments(
+        parameters$point_cloud,
+        dtm_path,
+        parameters$chunk_size,
+        parameters$voxel_resolution,
+        parameters$maximum_height,
+        instance_dimensions,
+        catalog_workers,
+        segment_work_directory,
+        bucket_count = parameters$segment_bucket_count,
+        base_selection = parameters$segment_catalog_base_selection,
+        point_order_dimension = parameters$point_order_dimension
       )
-      message(sprintf(
-        "Global segment pass found %d segments (%d accepted trees) across %d dimension(s)",
-        nrow(segments),
-        sum(segments$is_tree, na.rm = TRUE),
-        length(instance_dimensions)
-      ))
+      segments <- if (is.null(accumulated)) {
+        NULL
+      } else {
+        assign_segments_to_tiles(
+          finalize_segment_store(accumulated, parameters),
+          tiles
+        )
+      }
+      for (instance_dimension in instance_dimensions) {
+        target_dimension <- instance_dimension
+        segments_by_dimension[instance_dimension] <- list(
+          if (is.null(segments)) NULL else
+            segments[instance_dimension == target_dimension]
+        )
+      }
+      if (!is.null(segments)) {
+        message(sprintf(
+          "Global segment pass found %d segments (%d accepted trees) across %d dimension(s)",
+          nrow(segments),
+          sum(segments$is_tree, na.rm = TRUE),
+          length(instance_dimensions)
+        ))
+      }
+      temporary_disk_peak_bytes <- max(
+        temporary_disk_peak_bytes,
+        temporary_directory_bytes(run_work_directory)
+      )
       rm(accumulated)
     }
     unlink(segment_work_directory, recursive = TRUE, force = TRUE)
   }
 
   segment_seconds <- elapsed_seconds(segment_started)
+  message("FORESTSTRUCTURE_STAGE stage=segmentation status=completed")
 
   edge_flags <- compute_edge_flags(tiles, parameters$tile_size)
+  message("FORESTSTRUCTURE_STAGE stage=tiles status=started")
   tile_started <- proc.time()[["elapsed"]]
   tile_indices <- seq_len(nrow(tiles))
   tile_plan <- tile_worker_plan(thread_budget, length(tile_indices))
@@ -2039,12 +2762,14 @@ main <- function() {
       parameters
     )
     build_tile_row(
-      basename(parameters$point_cloud),
+      parameters$point_cloud_display_name,
       tiles[index, ],
       edge_flags[[index]],
       nrow(tiles),
       metrics,
-      empty_tree_metrics()
+      empty_tree_metrics(),
+      parameters$sensor,
+      parameters$country
     )
   }
   if (length(tile_indices) > 0L) {
@@ -2056,7 +2781,9 @@ main <- function() {
   }
   base_result <- collect_tile_rows(tile_indices, calculate_row, tile_workers)
   tile_seconds <- elapsed_seconds(tile_started)
+  message("FORESTSTRUCTURE_STAGE stage=tiles status=completed")
 
+  message("FORESTSTRUCTURE_STAGE stage=output status=started")
   output_started <- proc.time()[["elapsed"]]
   output_dimensions <- if (length(instance_dimensions) == 0) {
     list(NULL)
@@ -2066,22 +2793,24 @@ main <- function() {
   output_paths <- lapply(output_dimensions, function(instance_dimension) {
     target_dimension <- instance_dimension
     dimension_paths <- dimension_artifact_paths(paths, instance_dimension)
-    dimension_segments <- if (is.null(instance_dimension) || is.null(segments)) {
+    dimension_segments <- if (is.null(instance_dimension)) {
       NULL
     } else {
-      segments[instance_dimension == target_dimension]
+      segments_by_dimension[[target_dimension]]
     }
     result <- result_with_tree_metrics(base_result, dimension_segments)
     write_upstream_csv(result, dimension_paths$results)
     write_segment_diagnostics(
       dimension_segments,
-      parameters$point_cloud,
-      dimension_paths$segment_diagnostics
+      parameters$point_cloud_display_name,
+      dimension_paths$segment_diagnostics,
+      parameters$sensor,
+      parameters$country
     )
     write_tile_geojson(
       tiles,
       result,
-      dtm,
+      source_crs,
       dimension_paths$tiles_geojson
     )
     message(sprintf(
@@ -2096,7 +2825,7 @@ main <- function() {
     aoi,
     tiles,
     edge_flags,
-    basename(parameters$point_cloud),
+    parameters$point_cloud_display_name,
     parameters$tile_size,
     paths$tiles_png
   )
@@ -2116,12 +2845,18 @@ main <- function() {
         segments = segment_seconds,
         tiles = tile_seconds,
         outputs = output_seconds,
+        temporary_disk_peak_mib = temporary_disk_peak_bytes / 1024^2,
         total = elapsed_seconds(total_started)
       ),
       paths$performance
     )
   }
+  message("FORESTSTRUCTURE_STAGE stage=output status=completed")
   invisible(output_paths)
+}
+
+main <- function() {
+  run_analysis(parse_parameters())
 }
 
 if (!identical(Sys.getenv("FORESTSTRUCTURE_SOURCE_ONLY"), "1")) {
