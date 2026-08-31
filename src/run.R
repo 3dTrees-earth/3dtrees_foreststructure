@@ -17,6 +17,28 @@ DTM_CATALOG_SELECTION <- "xyz"
 SEGMENT_CATALOG_BASE_SELECTION <- "xyzrn"
 JULIA_MEMORY_SAFE_SEGMENT_SELECTION <- "xyz"
 
+restore_original_point_order <- function(las, point_order_dimension = NULL,
+                                         phase = "analysis") {
+  if (is.null(point_order_dimension) || is.empty(las)) return(las)
+  if (!point_order_dimension %in% names(las@data)) {
+    stop(sprintf(
+      "%s did not load required point-order dimension %s",
+      phase,
+      point_order_dimension
+    ))
+  }
+  point_order <- las@data[[point_order_dimension]]
+  if (anyNA(point_order) || anyDuplicated(point_order)) {
+    stop(sprintf(
+      "%s received missing or duplicate %s values",
+      phase,
+      point_order_dimension
+    ))
+  }
+  las@data <- las@data[order(point_order), ]
+  las
+}
+
 parameter_or <- function(parameters, name, default) {
   value <- parameters[[name]]
   if (is.null(value)) default else value
@@ -739,11 +761,17 @@ compute_edge_flags <- function(tiles, tile_size) {
 
 # Disk-backed DTM and CHM pipeline -----------------------------------------
 
-dtm_chunk <- function(chunk, dtm_resolution, ptd_resolution) {
+dtm_chunk <- function(chunk, dtm_resolution, ptd_resolution,
+                      point_order_dimension = NULL) {
   lidR::set_lidr_threads(1L)
   las <- readLAS(chunk)
   if (is.empty(las)) return(empty_chunk_raster(chunk, dtm_resolution))
-  assert_loaded_dimensions(las, c("X", "Y", "Z", "buffer"), "DTM")
+  assert_loaded_dimensions(
+    las,
+    c("X", "Y", "Z", "buffer", point_order_dimension),
+    "DTM"
+  )
+  las <- restore_original_point_order(las, point_order_dimension, "DTM")
   if (!las_has_nondegenerate_xy(las)) {
     message(
       "DTM chunk has fewer than three non-collinear input points; ",
@@ -760,6 +788,57 @@ dtm_chunk <- function(chunk, dtm_resolution, ptd_resolution) {
   )
   surface <- classified_ground_surface(las, dtm_resolution)
   if (is.null(surface)) empty_chunk_raster(chunk, dtm_resolution) else surface
+}
+
+tin_compatible_xy_scale <- function(las) {
+  xscale <- as.numeric(las@header@PHB[["X scale factor"]])
+  yscale <- as.numeric(las@header@PHB[["Y scale factor"]])
+  if (any(!is.finite(c(xscale, yscale))) ||
+      any(c(xscale, yscale) <= 0)) {
+    stop("LAS header contains invalid XY scale factors")
+  }
+
+  maximum_coordinate <- max(
+    abs(las@data[["X"]]),
+    abs(las@data[["Y"]]),
+    na.rm = TRUE
+  )
+  if (!is.finite(maximum_coordinate)) {
+    stop("LAS chunk contains no finite XY coordinates")
+  }
+
+  # lidR's Delaunay implementation converts absolute XY coordinates to signed
+  # 32-bit integers. Select the smallest decimal LAS scale that keeps that
+  # conversion below 95% of the integer limit, then preserve any coarser input
+  # scale. Only this in-memory DTM copy is rescaled; source files are unchanged.
+  minimum_safe_scale <- maximum_coordinate /
+    (0.95 * .Machine$integer.max)
+  decimal_safe_scale <- if (minimum_safe_scale > 0) {
+    10^ceiling(log10(minimum_safe_scale))
+  } else {
+    max(xscale, yscale)
+  }
+  target_scale <- max(xscale, yscale, decimal_safe_scale)
+
+  if (isTRUE(all.equal(xscale, target_scale)) &&
+      isTRUE(all.equal(yscale, target_scale))) {
+    return(las)
+  }
+
+  message(sprintf(
+    paste(
+      "Rescaling in-memory DTM XY coordinates from %.12g/%.12g m to",
+      "%.12g m for lidR TIN integer compatibility; source data are unchanged"
+    ),
+    xscale,
+    yscale,
+    target_scale
+  ))
+  las_rescale(
+    las,
+    xscale = target_scale,
+    yscale = target_scale
+  )
 }
 
 las_has_nondegenerate_xy <- function(las) {
@@ -830,6 +909,21 @@ classified_ground_surface <- function(las, dtm_resolution) {
   tryCatch(
     rasterize_terrain(las, res = dtm_resolution, algorithm = tin()),
     error = function(error) {
+      if (grepl(
+        "xy coordinates were not converted to integer",
+        conditionMessage(error),
+        fixed = TRUE
+      )) {
+        message(
+          "Retrying DTM TIN with an in-memory integer-compatible XY scale"
+        )
+        adjusted <- tin_compatible_xy_scale(las)
+        return(rasterize_terrain(
+          adjusted,
+          res = dtm_resolution,
+          algorithm = tin()
+        ))
+      }
       if (grepl(
         paste0(
           "cannot triangulate less than 3 points|No ground points found|",
@@ -1221,14 +1315,19 @@ cover_virtual_raster <- function(result, point_cloud, resolution,
 
 write_global_dtm <- function(point_cloud, output_path, work_directory,
                              chunk_size, dtm_buffer, dtm_resolution,
-                             ptd_resolution, workers, source_crs = NULL) {
+                             ptd_resolution, workers, source_crs = NULL,
+                             point_order_dimension = NULL) {
   prepare_raster_work_directory(work_directory, "DTM")
   on.exit(unlink(work_directory, recursive = TRUE, force = TRUE), add = TRUE)
 
   catalog <- readLAScatalog(point_cloud)
   opt_chunk_size(catalog) <- chunk_size
   opt_chunk_buffer(catalog) <- dtm_buffer
-  opt_select(catalog) <- DTM_CATALOG_SELECTION
+  opt_select(catalog) <- catalog_selection_for_dimensions(
+    point_cloud,
+    point_order_dimension,
+    DTM_CATALOG_SELECTION
+  )
   opt_progress(catalog) <- FALSE
   opt_output_files(catalog) <- file.path(work_directory, "dtm_{ID}")
   catalog@output_options$drivers$SpatRaster$param$datatype <- "FLT8S"
@@ -1242,6 +1341,7 @@ write_global_dtm <- function(point_cloud, output_path, work_directory,
       dtm_chunk,
       dtm_resolution = dtm_resolution,
       ptd_resolution = ptd_resolution,
+      point_order_dimension = point_order_dimension,
       .options = list(
         automerge = FALSE,
         drop_null = FALSE,
@@ -1315,10 +1415,11 @@ build_dtm_overlap_mosaic <- function(chunk_paths, work_directory,
 }
 
 chm_chunk <- function(chunk, dtm_path, voxel_resolution, maximum_height,
-                      chm_resolution) {
+                      chm_resolution, point_order_dimension = NULL) {
   lidR::set_lidr_threads(1L)
   las <- readLAS(chunk)
   if (is.empty(las)) return(empty_chunk_raster(chunk, chm_resolution))
+  las <- restore_original_point_order(las, point_order_dimension, "CHM")
   las <- normalize_height(las, terra::rast(dtm_path))
   las <- filter_poi(las, is.finite(Z) & Z >= 0 & Z <= maximum_height)
   if (is.empty(las)) return(empty_chunk_raster(chunk, chm_resolution))
@@ -1329,14 +1430,19 @@ chm_chunk <- function(chunk, dtm_path, voxel_resolution, maximum_height,
 
 write_global_chm <- function(point_cloud, dtm_path, output_path, work_directory,
                              chunk_size, voxel_resolution, maximum_height,
-                             chm_resolution, workers, source_crs = NULL) {
+                             chm_resolution, workers, source_crs = NULL,
+                             point_order_dimension = NULL) {
   prepare_raster_work_directory(work_directory, "CHM")
   on.exit(unlink(work_directory, recursive = TRUE, force = TRUE), add = TRUE)
 
   catalog <- readLAScatalog(point_cloud)
   opt_chunk_size(catalog) <- chunk_size
   opt_chunk_buffer(catalog) <- 0
-  opt_select(catalog) <- "xyz"
+  opt_select(catalog) <- catalog_selection_for_dimensions(
+    point_cloud,
+    point_order_dimension,
+    "xyz"
+  )
   opt_progress(catalog) <- FALSE
   opt_output_files(catalog) <- file.path(work_directory, "chm_{ID}")
   if (is.null(source_crs)) source_crs <- spatial_reference_wkt(catalog)
@@ -1351,6 +1457,7 @@ write_global_chm <- function(point_cloud, dtm_path, output_path, work_directory,
       voxel_resolution = voxel_resolution,
       maximum_height = maximum_height,
       chm_resolution = chm_resolution,
+      point_order_dimension = point_order_dimension,
       .options = list(
         automerge = FALSE,
         drop_null = FALSE,
@@ -1401,6 +1508,30 @@ segment_catalog_selection <- function(point_cloud, instance_dimensions,
     as.character(description$name)
   }, character(1))
   segment_selection_from_names(available, instance_dimensions, base_selection)
+}
+
+catalog_selection_for_dimensions <- function(point_cloud, dimensions,
+                                             base_selection = "xyz") {
+  dimensions <- dimensions[!is.na(dimensions) & nzchar(dimensions)]
+  if (length(dimensions) == 0L) return(base_selection)
+  header <- readLASheader(point_cloud)
+  extra_bytes <- header@VLR$Extra_Bytes[["Extra Bytes Description"]]
+  if (is.null(extra_bytes) || length(extra_bytes) == 0L) {
+    stop("requested catalog ExtraByte dimensions are absent")
+  }
+  available <- vapply(extra_bytes, function(description) {
+    as.character(description$name)
+  }, character(1))
+  missing <- setdiff(dimensions, available)
+  if (length(missing) > 0L) {
+    stop(sprintf(
+      "catalog is missing required ExtraByte dimension(s): %s",
+      paste(missing, collapse = ", ")
+    ))
+  }
+  positions <- unique(match(dimensions, available))
+  if (any(positions > 9L)) return(paste0(base_selection, "0"))
+  paste0(base_selection, paste(positions, collapse = ""))
 }
 
 segment_selection_from_names <- function(available, instance_dimensions,
@@ -1463,17 +1594,26 @@ write_segment_chunk_store <- function(voxels, layers, apex, work_directory,
 
 segment_chunk <- function(chunk, dtm_path, voxel_resolution, maximum_height,
                           instance_dimensions, work_directory, bucket_count,
-                          strict_dimensions = FALSE) {
+                          strict_dimensions = FALSE,
+                          point_order_dimension = NULL) {
   configure_catalog_worker()
   las <- readLAS(chunk)
   if (is.empty(las)) {
     if (!chunk_has_valid_extent(chunk)) return(NULL)
     return(list(paths = NULL))
   }
+  las <- restore_original_point_order(
+    las,
+    point_order_dimension,
+    "segment"
+  )
   if (isTRUE(strict_dimensions)) {
     assert_loaded_dimensions(
       las,
-      c("X", "Y", "Z", "buffer", instance_dimensions),
+      c(
+        "X", "Y", "Z", "buffer", instance_dimensions,
+        point_order_dimension
+      ),
       "segment"
     )
   }
@@ -1526,14 +1666,15 @@ accumulate_segments <- function(point_cloud, dtm_path, chunk_size,
                                 voxel_resolution, maximum_height,
                                 instance_dimensions, workers, work_directory,
                                 bucket_count = SEGMENT_BUCKET_COUNT,
-                                base_selection = SEGMENT_CATALOG_BASE_SELECTION) {
+                                base_selection = SEGMENT_CATALOG_BASE_SELECTION,
+                                point_order_dimension = NULL) {
   prepare_raster_work_directory(work_directory, "segment")
   catalog <- readLAScatalog(point_cloud)
   opt_chunk_size(catalog) <- chunk_size
   opt_chunk_buffer(catalog) <- 0
   selection <- segment_catalog_selection(
     point_cloud,
-    instance_dimensions,
+    c(instance_dimensions, point_order_dimension),
     base_selection
   )
   opt_select(catalog) <- selection
@@ -1558,6 +1699,7 @@ accumulate_segments <- function(point_cloud, dtm_path, chunk_size,
         base_selection,
         JULIA_MEMORY_SAFE_SEGMENT_SELECTION
       ),
+      point_order_dimension = point_order_dimension,
       .options = list(automerge = FALSE, drop_null = FALSE)
     )
   )
@@ -1953,14 +2095,27 @@ calculate_tile_metrics <- function(point_cloud, tile, dtm, parameters) {
 
   las <- readLAS(
     point_cloud,
-    select = "xyz",
+    select = catalog_selection_for_dimensions(
+      point_cloud,
+      parameters$point_order_dimension,
+      "xyz"
+    ),
     filter = sprintf(
       "-inside %.10f %.10f %.10f %.10f",
       bounds[["xmin"]], bounds[["ymin"]], bounds[["xmax"]], bounds[["ymax"]]
     )
   )
   if (is.empty(las)) return(empty)
-  assert_loaded_dimensions(las, c("X", "Y", "Z"), "tile")
+  assert_loaded_dimensions(
+    las,
+    c("X", "Y", "Z", parameters$point_order_dimension),
+    "tile"
+  )
+  las <- restore_original_point_order(
+    las,
+    parameters$point_order_dimension,
+    "tile"
+  )
 
   las <- normalize_height(las, dtm)
   las <- filter_poi(las, is.finite(Z) & Z >= 0 & Z <= parameters$maximum_height)
@@ -2357,6 +2512,9 @@ run_analysis <- function(parameters) {
   parameters$dimension_point_clouds <- parameter_or(
     parameters, "dimension_point_clouds", list()
   )
+  parameters$point_order_dimension <- parameter_or(
+    parameters, "point_order_dimension", NULL
+  )
   parameters$point_cloud_display_name <- parameter_or(
     parameters,
     "point_cloud_display_name",
@@ -2434,7 +2592,8 @@ run_analysis <- function(parameters) {
     parameters$dtm_resolution,
     parameters$ptd_resolution,
     catalog_workers,
-    source_crs
+    source_crs,
+    parameters$point_order_dimension
   )
   dtm <- terra::rast(dtm_path)
   if (terra::inMemory(dtm)) {
@@ -2460,7 +2619,8 @@ run_analysis <- function(parameters) {
     parameters$maximum_height,
     parameters$chm_resolution,
     catalog_workers,
-    source_crs
+    source_crs,
+    parameters$point_order_dimension
   )
   chm_seconds <- elapsed_seconds(chm_started)
   temporary_disk_peak_bytes <- max(
@@ -2506,7 +2666,8 @@ run_analysis <- function(parameters) {
           catalog_workers,
           dimension_directory,
           bucket_count = parameters$segment_bucket_count,
-          base_selection = parameters$segment_catalog_base_selection
+          base_selection = parameters$segment_catalog_base_selection,
+          point_order_dimension = parameters$point_order_dimension
         )
         dimension_segments <- if (is.null(accumulated)) {
           NULL
@@ -2544,7 +2705,8 @@ run_analysis <- function(parameters) {
         catalog_workers,
         segment_work_directory,
         bucket_count = parameters$segment_bucket_count,
-        base_selection = parameters$segment_catalog_base_selection
+        base_selection = parameters$segment_catalog_base_selection,
+        point_order_dimension = parameters$point_order_dimension
       )
       segments <- if (is.null(accumulated)) {
         NULL

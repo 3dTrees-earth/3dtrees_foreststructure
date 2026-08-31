@@ -37,7 +37,7 @@ if [[ "${julia_script_sha256}" != "746d57b4c937001af31e4ccd1b9f14edb5cebb15d4615
   exit 2
 fi
 
-image_name="${FORESTSTRUCTURE_JULIA_IMAGE:-3dtrees-foreststructure:julia-memory-safe-dataset150-final3}"
+image_name="${FORESTSTRUCTURE_JULIA_IMAGE:-3dtrees-foreststructure:julia-memory-safe-local}"
 validation_parent="${FORESTSTRUCTURE_CANARY_ROOT:-/mnt/ssds/kg281/_foreststructure_julia_memory_safe_validation/medium_large}"
 test_cpus="${FORESTSTRUCTURE_TEST_CPUS:-15}"
 catalog_workers="${FORESTSTRUCTURE_CATALOG_WORKERS:-2}"

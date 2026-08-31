@@ -4,9 +4,14 @@ suppressPackageStartupMessages({
 })
 
 arguments <- commandArgs(trailingOnly = TRUE)
-if (length(arguments) != 2L) {
-  stop("usage: generate_julia_memory_safe_fixture.R OUTPUT.laz AOI.geojson")
+if (!length(arguments) %in% c(2L, 3L)) {
+  stop(paste(
+    "usage: generate_julia_memory_safe_fixture.R OUTPUT.laz AOI.geojson",
+    "[distinct-dimensions]"
+  ))
 }
+distinct_dimensions <- length(arguments) == 3L &&
+  identical(arguments[[3]], "distinct-dimensions")
 set.seed(150)
 
 ground <- expand.grid(X = seq(1000, 1040, by = 1), Y = seq(2000, 2040, by = 1))
@@ -22,6 +27,20 @@ points$ReturnNumber <- 1L
 points$NumberOfReturns <- 1L
 points$Classification <- 1L
 instance <- c(rep.int(0L, nrow(ground)), ifelse(canopy$X < 1020, 11L, 22L))
+instance_sat <- if (distinct_dimensions) {
+  c(rep.int(0L, nrow(ground)), ifelse(canopy$Y < 2020, 101L, 202L))
+} else {
+  instance
+}
+instance_fm <- if (distinct_dimensions) {
+  c(
+    rep.int(0L, nrow(ground)),
+    300L + as.integer(canopy$X >= 1020) * 2L +
+      as.integer(canopy$Y >= 2020) + 1L
+  )
+} else {
+  instance
+}
 
 las <- LAS(points)
 for (index in seq_len(10L)) {
@@ -32,12 +51,17 @@ for (index in seq_len(10L)) {
     "Unrelated synthetic ExtraByte"
   )
 }
-for (dimension in c("PredInstance", "PredInstance_SAT", "PredInstance_FM")) {
+dimension_values <- list(
+  PredInstance = instance,
+  PredInstance_SAT = instance_sat,
+  PredInstance_FM = instance_fm
+)
+for (dimension in names(dimension_values)) {
   las <- add_lasattribute(
     las,
-    instance,
+    dimension_values[[dimension]],
     dimension,
-    "Identical synthetic instance identifier"
+    "Synthetic instance identifier"
   )
 }
 writeLAS(las, arguments[[1]])

@@ -5,6 +5,38 @@ suppressPackageStartupMessages({
 })
 
 MAX_MEMORY_BUDGET_GIB <- 70
+POINT_ORDER_DIMENSION <- "OriginalPointIndex"
+
+is_copc_point_cloud <- function(path) {
+  grepl("\\.copc\\.laz$", path, ignore.case = TRUE)
+}
+
+point_cloud_xyz_bounds <- function(path) {
+  header <- readLASheader(path)
+  c(
+    xmin = as.numeric(header@PHB[["Min X"]]),
+    ymin = as.numeric(header@PHB[["Min Y"]]),
+    zmin = as.numeric(header@PHB[["Min Z"]]),
+    xmax = as.numeric(header@PHB[["Max X"]]),
+    ymax = as.numeric(header@PHB[["Max Y"]]),
+    zmax = as.numeric(header@PHB[["Max Z"]])
+  )
+}
+
+validate_original_companion <- function(requested_point_cloud, point_cloud) {
+  requested_count <- point_count_from_las_header(requested_point_cloud)
+  source_count <- point_count_from_las_header(point_cloud)
+  requested_bounds <- point_cloud_xyz_bounds(requested_point_cloud)
+  source_bounds <- point_cloud_xyz_bounds(point_cloud)
+  if (requested_count != source_count ||
+      any(abs(requested_bounds - source_bounds) > 1e-9)) {
+    stop(paste(
+      "--original-point-cloud does not match the COPC header point count",
+      "and XYZ bounds"
+    ))
+  }
+  invisible(TRUE)
+}
 
 script_argument <- grep(
   "^--file=",
@@ -28,6 +60,7 @@ parse_julia_memory_safe_parameters <- function() {
     )
   )
   parser$add_argument("--point-cloud", required = TRUE)
+  parser$add_argument("--original-point-cloud", default = NULL)
   parser$add_argument("--aoi-geojson", required = TRUE)
   parser$add_argument("--dataset-id", required = TRUE, type = "integer")
   parser$add_argument("--output-dir", required = TRUE)
@@ -71,8 +104,22 @@ parse_julia_memory_safe_parameters <- function() {
       !grepl("\\.la[sz]$", arguments$point_cloud, ignore.case = TRUE)) {
     stop("--point-cloud must be exactly one existing LAS/LAZ file")
   }
-  if (grepl("\\.copc\\.laz$", arguments$point_cloud, ignore.case = TRUE)) {
-    stop("Julia-faithful analysis requires the original LAZ, never a COPC")
+  if (is_copc_point_cloud(arguments$point_cloud)) {
+    if (!is.null(arguments$original_point_cloud) &&
+        (!file.exists(arguments$original_point_cloud) ||
+        !grepl(
+          "\\.la[sz]$",
+          arguments$original_point_cloud,
+          ignore.case = TRUE
+        ) ||
+        is_copc_point_cloud(arguments$original_point_cloud))) {
+      stop(paste(
+        "--original-point-cloud must be an existing non-COPC LAS/LAZ",
+        "when supplied for COPC identity validation"
+      ))
+    }
+  } else if (!is.null(arguments$original_point_cloud)) {
+    stop("--original-point-cloud is only valid when --point-cloud is a COPC")
   }
   if (!file.exists(arguments$aoi_geojson) ||
       !grepl("\\.(geojson|json)$", arguments$aoi_geojson, ignore.case = TRUE)) {
@@ -318,7 +365,44 @@ python_package_versions <- function() {
 julia_memory_safe_main <- function() {
   arguments <- parse_julia_memory_safe_parameters()
   message("FORESTSTRUCTURE_STAGE stage=preflight status=started")
-  point_cloud <- normalizePath(arguments$point_cloud, mustWork = TRUE)
+  requested_point_cloud <- normalizePath(arguments$point_cloud, mustWork = TRUE)
+  original_point_cloud <- if (is.null(arguments$original_point_cloud)) {
+    NULL
+  } else {
+    normalizePath(arguments$original_point_cloud, mustWork = TRUE)
+  }
+  requested_is_copc <- is_copc_point_cloud(requested_point_cloud)
+  point_cloud <- requested_point_cloud
+  point_cloud_display_name <- if (is.null(original_point_cloud)) {
+    basename(point_cloud)
+  } else {
+    basename(original_point_cloud)
+  }
+  point_order_dimension <- if (requested_is_copc) {
+    POINT_ORDER_DIMENSION
+  } else {
+    NULL
+  }
+  if (requested_is_copc) {
+    definitions <- extra_byte_definitions(requested_point_cloud)
+    available <- vapply(definitions, function(definition) {
+      definition$name
+    }, character(1))
+    if (!POINT_ORDER_DIMENSION %in% available) {
+      stop(paste(
+        "COPC scientific input requires the OriginalPointIndex ExtraByte;",
+        "rebuild COPC from the ordered source before ForestStructure"
+      ))
+    }
+    if (!is.null(original_point_cloud)) {
+      validate_original_companion(requested_point_cloud, original_point_cloud)
+    }
+    message(sprintf(
+      "Using COPC spatial streaming with %s order restoration from %s",
+      POINT_ORDER_DIMENSION,
+      basename(point_cloud)
+    ))
+  }
   aoi_geojson <- normalizePath(arguments$aoi_geojson, mustWork = TRUE)
   input_sha256 <- sha256_file(point_cloud)
   job_directory <- tempfile(
@@ -340,16 +424,18 @@ julia_memory_safe_main <- function() {
   if (!file.symlink(point_cloud, staged_point_cloud)) {
     stop("cannot stage original point cloud by local-SSD symbolic link")
   }
-  lax_path <- sub("\\.la[sz]$", ".lax", staged_point_cloud, ignore.case = TRUE)
-  tryCatch(
-    rlas::writelax(staged_point_cloud),
-    error = function(error) message(
-      "Spatial-index creation failed; continuing with selective scans: ",
-      conditionMessage(error)
+  if (!requested_is_copc) {
+    lax_path <- sub("\\.la[sz]$", ".lax", staged_point_cloud, ignore.case = TRUE)
+    tryCatch(
+      rlas::writelax(staged_point_cloud),
+      error = function(error) message(
+        "Spatial-index creation failed; continuing with selective scans: ",
+        conditionMessage(error)
+      )
     )
-  )
-  if (file.exists(lax_path)) {
-    message(sprintf("Built local spatial index %s", basename(lax_path)))
+    if (file.exists(lax_path)) {
+      message(sprintf("Built local spatial index %s", basename(lax_path)))
+    }
   }
 
   message("FORESTSTRUCTURE_STAGE stage=aoi_conversion status=started")
@@ -389,6 +475,19 @@ julia_memory_safe_main <- function() {
       paste(missing, collapse = ", ")
     ))
   }
+  if (requested_is_copc) {
+    selective_dimensions <- unique(c(point_order_dimension, dimensions))
+    selective_ordinals <- match(selective_dimensions, available)
+    unsupported <- selective_dimensions[selective_ordinals > 9L]
+    if (length(unsupported) > 0L) {
+      stop(paste(
+        "COPC selective streaming requires OriginalPointIndex and requested",
+        "instance dimensions among the first nine ExtraBytes; rebuild the",
+        "COPC with build_original_order_copc.sh. Unsupported:",
+        paste(unsupported, collapse = ", ")
+      ))
+    }
+  }
 
   dimension_sources <- list()
   selectors <- list()
@@ -396,9 +495,9 @@ julia_memory_safe_main <- function() {
   for (dimension in dimensions) {
     ordinal <- match(dimension, available)
     definition <- definitions[[ordinal]]
-    if (ordinal <= 9L) {
+    if (ordinal <= 9L || requested_is_copc) {
       dimension_sources[[dimension]] <- staged_point_cloud
-      selector <- paste0("xyz", ordinal)
+      selector <- if (ordinal <= 9L) paste0("xyz", ordinal) else "xyz0"
     } else {
       projection_path <- file.path(
         job_directory,
@@ -425,8 +524,20 @@ julia_memory_safe_main <- function() {
       selector
     ))
   }
-  message("SELECTOR phase=dtm selector=xyz")
-  message("SELECTOR phase=tile selector=xyz")
+  point_order_ordinal <- if (is.null(point_order_dimension)) {
+    NA_integer_
+  } else {
+    match(point_order_dimension, available)
+  }
+  point_order_selector <- if (is.na(point_order_ordinal)) {
+    "xyz"
+  } else if (point_order_ordinal <= 9L) {
+    paste0("xyz", point_order_ordinal)
+  } else {
+    "xyz0"
+  }
+  message(sprintf("SELECTOR phase=dtm selector=%s", point_order_selector))
+  message(sprintf("SELECTOR phase=tile selector=%s", point_order_selector))
   message("FORESTSTRUCTURE_STAGE stage=dimension_projection status=completed")
 
   thread_count <- suppressWarnings(as.integer(Sys.getenv(
@@ -485,7 +596,8 @@ julia_memory_safe_main <- function() {
     segment_catalog_base_selection = JULIA_MEMORY_SAFE_SEGMENT_SELECTION,
     segment_bucket_count = segment_bucket_count,
     dimension_point_clouds = dimension_sources,
-    point_cloud_display_name = basename(point_cloud)
+    point_cloud_display_name = point_cloud_display_name,
+    point_order_dimension = point_order_dimension
   )
   message("FORESTSTRUCTURE_STAGE stage=analysis status=started")
   run_analysis(parameters)
@@ -504,7 +616,15 @@ julia_memory_safe_main <- function() {
     source_point_cloud = normalizePath(point_cloud, mustWork = TRUE),
     source_point_cloud_sha256 = input_sha256,
     source_point_count = point_count_from_las_header(point_cloud),
-    source_is_copc = FALSE,
+    source_is_copc = requested_is_copc,
+    requested_point_cloud = requested_point_cloud,
+    requested_is_copc = requested_is_copc,
+    companion_header_identity_validated = (
+      requested_is_copc && !is.null(original_point_cloud)
+    ),
+    original_point_cloud = original_point_cloud,
+    point_order_dimension = point_order_dimension,
+    catalog_spatial_streaming = if (requested_is_copc) "COPC" else "LAS/LAZ",
     requested_instance_dimensions = arguments$instance_dimension,
     processed_instance_dimensions = dimensions,
     missing_instance_dimensions = missing,
@@ -557,7 +677,7 @@ julia_memory_safe_main <- function() {
     dimensions,
     arguments$memory_budget_gib,
     point_count_from_las_header(point_cloud),
-    basename(point_cloud),
+    point_cloud_display_name,
     arguments$sensor,
     arguments$country
   )

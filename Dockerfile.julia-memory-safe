@@ -18,12 +18,13 @@ COPY src /opt/foreststructure
 RUN chmod -R a+rX /opt/foreststructure
 
 LABEL org.opencontainers.image.source="https://github.com/3dTrees-earth/3dtrees_foreststructure" \
-      org.opencontainers.image.description="Julia-faithful memory-safe ForestStructure candidate" \
+      org.opencontainers.image.description="Ordered-COPC Julia-parity ForestStructure pipeline" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.version="${IMAGE_VERSION}" \
       earth.3dtrees.algorithm-base.image="3dtrees-foreststructure:v0.1.2" \
       earth.3dtrees.lidr.version="4.3.2" \
       earth.3dtrees.memory-budget.max-gib="70" \
-      earth.3dtrees.execution-mode="julia-memory-safe"
+      earth.3dtrees.execution-mode="julia-memory-safe" \
+      earth.3dtrees.instance-dimensions="PredInstance,PredInstance_SAT,PredInstance_FM"
 
 ENTRYPOINT ["Rscript", "/opt/foreststructure/run_julia_memory_safe.R"]
