@@ -1,8 +1,10 @@
-# Performance benchmark
+# Performance benchmarks
 
-The benchmark drives the public container CLI with deterministic synthetic,
-segmented point clouds. It records point/tile counts, every parameter, phase
-wall times, effective threads, and the R process's peak RSS (`VmHWM`).
+The benchmark suite drives the public container CLI and records point/tile
+counts, scientific parameters, phase wall times, effective threads, R-process
+peak RSS (`VmHWM`) and cgroup-wide peak memory. Small deterministic fixtures
+remain useful for local profiling; the current release reference is the
+production-scale dataset 107 comparison below.
 
 ```bash
 docker build -t 3dtrees-foreststructure:benchmark .
@@ -12,56 +14,48 @@ bash benchmarks/run_benchmark.sh \
   1
 ```
 
-To compare a candidate with a preserved baseline image, run both images against
-the same work directory and then execute `benchmarks/compare_runs.R` inside
+To compare two synthetic runs, execute `benchmarks/compare_runs.R` inside
 either image. The comparator requires equal CSV and diagnostic values, matching
 tile geometries, and equal DTM/CHM geometry, CRS, and cell values within
 absolute/relative tolerance `1e-9`.
 
-## 2026-07-20 results
+## Current result: dataset 107, 2026-08-31
 
-Both runs used one lidR thread and the documented scientific defaults.
+Dataset 107 is a 156,184,097-point cloud covering 25 complete analysis tiles.
+The candidate first converted the 2,768,471,261-byte ordered LAZ into a
+4,284,572,283-byte COPC with a zero-based `OriginalPointIndex`, then used COPC
+spatial streaming while restoring original record order within every chunk.
 
-| Fixture | Baseline | Optimized | Change | Peak RSS change |
-| --- | ---: | ---: | ---: | ---: |
-| 50,000 points / 9 tiles | 4.248 s | 2.897 s | -31.8% | 414.2 → 409.8 MiB |
-| 500,000 points / 36 tiles | 17.713 s | 15.112 s | -14.7% | 506.1 → 500.7 MiB |
+| Measurement | Ordered LAZ baseline | Indexed COPC candidate | Change |
+| --- | ---: | ---: | ---: |
+| CPUs / LAScatalog workers | 12 / 2 | 10 / 1 | fewer resources |
+| Container / internal memory limit | 37 / 32 GiB | 30 / 25 GiB | lower limits |
+| Analysis runtime | 6,217.955 s | 1,996.875 s | -67.9% (3.11x) |
+| Cgroup peak memory | 29,023.309 MiB | 17,767.770 MiB | -38.8% |
+| DTM | 864.246 s | 893.619 s | +3.4% |
+| CHM | 781.908 s | 370.590 s | -52.6% |
+| Segmentation | 821.788 s | 389.765 s | -52.6% |
+| Tile metrics | 3,748.338 s | 341.213 s | -90.9% |
 
-The accepted changes are:
+COPC construction plus streaming point/index validation took 215.656 seconds.
+The complete candidate benchmark—from COPC construction through all output
+comparisons—took 2,234.749 seconds (37m 14.749s), still 64.1% below the
+baseline analysis runtime.
 
-- stop the exact offset search when it reaches the AOI-area upper bound; and
-- read only XYZ plus extra byte zero during the global segment pass when the
-  selected Instance Dimension is the first extra byte, falling back to all
-  dimensions for later aliases.
+The indexed COPC passed exact header, point-count, index-range and dual-64-bit
+tuple-fingerprint validation over all points. Scientific comparison against
+`valid_updated` then passed at zero tolerance:
 
-The complete scientific differential passed at `1e-9`, and the full container
-acceptance matrix passed afterward. Raw summary values are committed in
-`benchmarks/results/2026-07-20.csv`.
+- 25 result rows with zero differing values;
+- 900 segment-diagnostic rows with zero differing values;
+- identical tile GeoJSON after excluding only the source-file metadata field;
+- 14,632 DTM cells with identical geometry, masks and values; and
+- 57,810 CHM cells with identical geometry, masks and values.
 
-## Evaluated alternatives
-
-- Temporary symlinked and genuine adjacent `.lax` indices did not improve tile
-  reads in this lidR/rlas path; the large run remained 17.9–18.0 s.
-- Batching many grid candidates into fewer GEOS calls did not improve the grid
-  phase and slightly increased total time.
-- Four lidR threads were effectively neutral on these fixtures (17.579 s versus
-  17.713 s at one thread) and slightly increased observed peak RSS.
-- An explicit phase-boundary `gc()` added about 0.2 s and cannot reduce the
-  already-recorded high-water mark, so it was removed. The obsolete accumulated
-  segment tables are still dereferenced before tile processing.
-- Combining the global DTM and segment passes was not attempted: they require
-  different classification/aggregation semantics, and holding a shared raw
-  cloud would weaken the streaming memory contract. Result assembly was also
-  not targeted because it already uses `lapply`/`rbindlist` and measured below
-  one percent of the large run.
-
-## Runtime guidance
-
-- Keep `--grid-search-step 0.5` for strict method equivalence. A coarser value
-  remains an optimized search but deliberately changes the candidate lattice.
-- Set `--threads` to the CPUs actually allocated by the scheduler. One to four
-  threads produced similar results here; do not request excess cores expecting
-  linear speedup.
-- Small clouds are dominated by fixed DTM and grid setup. Larger clouds are
-  dominated by per-tile point processing, so runtime grows with both point and
-  valid-tile counts.
+The candidate image was
+`3dtrees-foreststructure:julia-memory-safe-copc-all-instances-dtmfix-20260829`
+(`sha256:cfc7948984ab28f8708741d69bf6c7c9a6ed8d7f3eb3377a32db0e0509a98f44`).
+Raw summary values are committed in
+`benchmarks/results/2026-08-31-dataset107.csv`. The large COPC, rasters and
+verbose logs remain external benchmark artifacts and are intentionally not
+stored in Git.
