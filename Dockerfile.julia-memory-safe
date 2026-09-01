@@ -11,9 +11,7 @@ ARG LASPY_VERSION=2.6.1
 ARG LAZRS_VERSION=0.7.0
 
 # This Dockerfile builds the ordered-COPC implementation at the checked-out
-# revision. The eight direct-LAZ workers observed on 2026-08-31 use the
-# historical form of this Dockerfile at revision 11d5631. See DOCKER.md for
-# exact image identities, resource profiles and the three-way comparison.
+# revision. See COPC_REVIEW_GUIDE.md for the input contract and design.
 
 # Install no recommended system extras, remove apt metadata, and pin Python LAS
 # readers so local, CI, and production images interpret ExtraBytes identically.
@@ -36,7 +34,7 @@ RUN chmod -R a+rX /opt/foreststructure
 LABEL org.opencontainers.image.source="https://github.com/3dTrees-earth/3dtrees_foreststructure" \
       org.opencontainers.image.title="3Dtrees ForestStructure ordered-COPC" \
       org.opencontainers.image.description="Julia-parity forest metrics with COPC spatial streaming and OriginalPointIndex order restoration" \
-      org.opencontainers.image.documentation="https://github.com/3dTrees-earth/3dtrees_foreststructure/blob/main/DOCKER.md" \
+      org.opencontainers.image.documentation="https://github.com/3dTrees-earth/3dtrees_foreststructure/blob/main/COPC_REVIEW_GUIDE.md" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.version="${IMAGE_VERSION}" \
       earth.3dtrees.algorithm-base.image="3dtrees-foreststructure:v0.1.2" \
