@@ -1,5 +1,9 @@
 # 3Dtrees Forest Structure
 
+For a reviewer-oriented explanation of every ordered-COPC stage and the exact
+code ownership across files, start with
+[`COPC_REVIEW_GUIDE.md`](COPC_REVIEW_GUIDE.md).
+
 `3dtrees_foreststructure` computes forest-structure indices for fixed-size
 Analysis Tiles across a point cloud, optionally constrained by an audited
 footprint.

@@ -4,15 +4,22 @@ suppressPackageStartupMessages({
   library(lidR)
 })
 
+# Hard ceiling validated for this execution mode; the caller may request less.
 MAX_MEMORY_BUDGET_GIB <- 70
+# Canonical COPC files carry this UInt64 source-row key as their first ExtraByte.
 POINT_ORDER_DIMENSION <- "OriginalPointIndex"
 
+# Identify COPC from the standard double extension while accepting case variants.
 is_copc_point_cloud <- function(path) {
   grepl("\\.copc\\.laz$", path, ignore.case = TRUE)
 }
 
+# Read exact header bounds without loading any point records.  These values form
+# the inexpensive companion-file identity check below.
 point_cloud_xyz_bounds <- function(path) {
+  # lidR exposes LAS/COPC public-header fields through the same header object.
   header <- readLASheader(path)
+  # Return a named vector so comparison order is explicit and reviewable.
   c(
     xmin = as.numeric(header@PHB[["Min X"]]),
     ymin = as.numeric(header@PHB[["Min Y"]]),
@@ -23,11 +30,17 @@ point_cloud_xyz_bounds <- function(path) {
   )
 }
 
+# The original LAZ is optional at runtime and is never used for computation.
+# When supplied, prove that it describes the same cloud as the requested COPC so
+# provenance cannot accidentally name an unrelated ordered source.
 validate_original_companion <- function(requested_point_cloud, point_cloud) {
+  # Compare header counts without paying the cost of two full point scans.
   requested_count <- point_count_from_las_header(requested_point_cloud)
   source_count <- point_count_from_las_header(point_cloud)
+  # Compare all six XYZ extrema at a tolerance far below source quantization.
   requested_bounds <- point_cloud_xyz_bounds(requested_point_cloud)
   source_bounds <- point_cloud_xyz_bounds(point_cloud)
+  # Either disagreement means the companion cannot safely describe this COPC.
   if (requested_count != source_count ||
       any(abs(requested_bounds - source_bounds) > 1e-9)) {
     stop(paste(
@@ -35,6 +48,7 @@ validate_original_companion <- function(requested_point_cloud, point_cloud) {
       "and XYZ bounds"
     ))
   }
+  # Return invisibly because success is a guard, not a scientific value.
   invisible(TRUE)
 }
 
@@ -59,7 +73,9 @@ parse_julia_memory_safe_parameters <- function() {
       "and disk-backed memory guards"
     )
   )
+  # ``--point-cloud`` is the sole scientific input and may now be canonical COPC.
   parser$add_argument("--point-cloud", required = TRUE)
+  # ``--original-point-cloud`` is optional identity/provenance evidence only.
   parser$add_argument("--original-point-cloud", default = NULL)
   parser$add_argument("--aoi-geojson", required = TRUE)
   parser$add_argument("--dataset-id", required = TRUE, type = "integer")
@@ -104,7 +120,9 @@ parse_julia_memory_safe_parameters <- function() {
       !grepl("\\.la[sz]$", arguments$point_cloud, ignore.case = TRUE)) {
     stop("--point-cloud must be exactly one existing LAS/LAZ file")
   }
+  # COPC accepts an optional non-COPC companion; computation still reads COPC.
   if (is_copc_point_cloud(arguments$point_cloud)) {
+    # Reject a missing, wrongly typed, or second-COPC companion before staging.
     if (!is.null(arguments$original_point_cloud) &&
         (!file.exists(arguments$original_point_cloud) ||
         !grepl(
@@ -118,6 +136,7 @@ parse_julia_memory_safe_parameters <- function() {
         "when supplied for COPC identity validation"
       ))
     }
+  # A companion has no role when the requested source is already ordered LAS/LAZ.
   } else if (!is.null(arguments$original_point_cloud)) {
     stop("--original-point-cloud is only valid when --point-cloud is a COPC")
   }
@@ -363,40 +382,55 @@ python_package_versions <- function() {
 }
 
 julia_memory_safe_main <- function() {
+  # Parse and validate every external path/resource setting before creating work.
   arguments <- parse_julia_memory_safe_parameters()
   message("FORESTSTRUCTURE_STAGE stage=preflight status=started")
+  # Retain the user-requested path separately from later local staging paths.
   requested_point_cloud <- normalizePath(arguments$point_cloud, mustWork = TRUE)
+  # Normalize optional companion evidence once; NULL remains an explicit absence.
   original_point_cloud <- if (is.null(arguments$original_point_cloud)) {
     NULL
   } else {
     normalizePath(arguments$original_point_cloud, mustWork = TRUE)
   }
+  # This single flag controls order restoration, spatial-index handling, and
+  # provenance so COPC behavior cannot diverge across independent checks.
   requested_is_copc <- is_copc_point_cloud(requested_point_cloud)
+  # Scientific computation always reads the requested cloud (COPC when supplied).
   point_cloud <- requested_point_cloud
+  # Preserve Julia's historical source filename in result rows when a companion
+  # is available, even though point data are spatially streamed from COPC.
   point_cloud_display_name <- if (is.null(original_point_cloud)) {
     basename(point_cloud)
   } else {
     basename(original_point_cloud)
   }
+  # Non-COPC records are already ordered; COPC must be sorted per chunk by key.
   point_order_dimension <- if (requested_is_copc) {
     POINT_ORDER_DIMENSION
   } else {
     NULL
   }
+  # Enforce the canonical-COPC contract before running expensive analysis.
   if (requested_is_copc) {
+    # Read declared ExtraBytes from the COPC header without materializing points.
     definitions <- extra_byte_definitions(requested_point_cloud)
+    # Reduce definitions to names for the mandatory order-key membership check.
     available <- vapply(definitions, function(definition) {
       definition$name
     }, character(1))
+    # A generic COPC cannot reproduce order-sensitive Julia outputs safely.
     if (!POINT_ORDER_DIMENSION %in% available) {
       stop(paste(
         "COPC scientific input requires the OriginalPointIndex ExtraByte;",
         "rebuild COPC from the ordered source before ForestStructure"
       ))
     }
+    # Validate optional provenance evidence, but do not substitute it for COPC.
     if (!is.null(original_point_cloud)) {
       validate_original_companion(requested_point_cloud, original_point_cloud)
     }
+    # Make the selected streaming/order mode explicit in operational logs.
     message(sprintf(
       "Using COPC spatial streaming with %s order restoration from %s",
       POINT_ORDER_DIMENSION,
@@ -420,10 +454,14 @@ julia_memory_safe_main <- function() {
     unlink(incoming_directory, recursive = TRUE, force = TRUE)
   }, add = TRUE)
 
+  # Stage by symlink so all processing stays on the requested COPC without an
+  # expensive duplicate copy into the per-job work directory.
   staged_point_cloud <- file.path(job_directory, basename(point_cloud))
   if (!file.symlink(point_cloud, staged_point_cloud)) {
     stop("cannot stage original point cloud by local-SSD symbolic link")
   }
+  # Plain LAS/LAZ benefits from a sidecar LAX; COPC already contains its spatial
+  # hierarchy and must not be rewritten or supplemented with a LAX index.
   if (!requested_is_copc) {
     lax_path <- sub("\\.la[sz]$", ".lax", staged_point_cloud, ignore.case = TRUE)
     tryCatch(
@@ -475,6 +513,9 @@ julia_memory_safe_main <- function() {
       paste(missing, collapse = ", ")
     ))
   }
+  # lidR can selectively request only ExtraBytes 1-9 from COPC.  Requiring the
+  # key and requested instance fields in that window keeps reads spatial and
+  # avoids silently falling back to repeated full-cloud scans.
   if (requested_is_copc) {
     selective_dimensions <- unique(c(point_order_dimension, dimensions))
     selective_ordinals <- match(selective_dimensions, available)
@@ -489,12 +530,18 @@ julia_memory_safe_main <- function() {
     }
   }
 
+  # Track the actual source and selector used for each instance dimension; these
+  # maps feed both execution and the durable provenance report.
   dimension_sources <- list()
   selectors <- list()
   projections <- list()
+  # Resolve each requested segmentation field independently.
   for (dimension in dimensions) {
+    # ExtraByte ordinal maps directly to lidR selector digits 1-9.
     ordinal <- match(dimension, available)
     definition <- definitions[[ordinal]]
+    # Canonical COPC guarantees streamable placement.  Plain LAZ may still need
+    # a one-dimension projection when its field is beyond lidR's selector window.
     if (ordinal <= 9L || requested_is_copc) {
       dimension_sources[[dimension]] <- staged_point_cloud
       selector <- if (ordinal <= 9L) paste0("xyz", ordinal) else "xyz0"
@@ -524,11 +571,14 @@ julia_memory_safe_main <- function() {
       selector
     ))
   }
+  # Resolve the order-key selector once for DTM, CHM, and tile reads.
   point_order_ordinal <- if (is.null(point_order_dimension)) {
     NA_integer_
   } else {
     match(point_order_dimension, available)
   }
+  # ``xyz`` is sufficient for already ordered LAZ; canonical COPC normally uses
+  # ``xyz1`` because OriginalPointIndex is deliberately the first ExtraByte.
   point_order_selector <- if (is.na(point_order_ordinal)) {
     "xyz"
   } else if (point_order_ordinal <= 9L) {
@@ -562,6 +612,8 @@ julia_memory_safe_main <- function() {
       segment_bucket_count > 65536L) {
     stop("FORESTSTRUCTURE_SEGMENT_BUCKET_COUNT must be an integer from 1 to 65536")
   }
+  # Preserve Julia's scientific constants exactly.  Only storage, selection,
+  # resource controls, and record-order restoration differ in this runner.
   parameters <- list(
     point_cloud = staged_point_cloud,
     dataset_id = arguments$dataset_id,
@@ -595,8 +647,11 @@ julia_memory_safe_main <- function() {
     sequential_instance_dimensions = TRUE,
     segment_catalog_base_selection = JULIA_MEMORY_SAFE_SEGMENT_SELECTION,
     segment_bucket_count = segment_bucket_count,
+    # Per-dimension sources support legacy LAZ projection without changing COPC.
     dimension_point_clouds = dimension_sources,
+    # Result metadata should identify the original ordered filename when known.
     point_cloud_display_name = point_cloud_display_name,
+    # NULL disables sorting for LAZ; the key enables deterministic COPC sorting.
     point_order_dimension = point_order_dimension
   )
   message("FORESTSTRUCTURE_STAGE stage=analysis status=started")
@@ -609,6 +664,8 @@ julia_memory_safe_main <- function() {
   temporary_disk_peak_mib <- performance$temporary_disk_peak_mib[[1]] +
     temporary_directory_bytes(job_directory) / 1024^2
 
+  # Persist enough provenance to prove that the run used COPC spatial streaming,
+  # restored original order, and optionally validated the original companion.
   run_provenance <- list(
     status = "candidate",
     mode = "julia-memory-safe",
@@ -616,13 +673,17 @@ julia_memory_safe_main <- function() {
     source_point_cloud = normalizePath(point_cloud, mustWork = TRUE),
     source_point_cloud_sha256 = input_sha256,
     source_point_count = point_count_from_las_header(point_cloud),
+    # ``source_*`` records the file actually read for scientific computation.
     source_is_copc = requested_is_copc,
+    # ``requested_*`` records the caller-facing input before local symlinking.
     requested_point_cloud = requested_point_cloud,
     requested_is_copc = requested_is_copc,
+    # This is true only when an explicit companion passed count/bounds checks.
     companion_header_identity_validated = (
       requested_is_copc && !is.null(original_point_cloud)
     ),
     original_point_cloud = original_point_cloud,
+    # These fields make order restoration and streaming mode machine-auditable.
     point_order_dimension = point_order_dimension,
     catalog_spatial_streaming = if (requested_is_copc) "COPC" else "LAS/LAZ",
     requested_instance_dimensions = arguments$instance_dimension,

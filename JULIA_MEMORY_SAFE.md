@@ -1,5 +1,9 @@
 # Ordered-COPC Julia-parity pipeline
 
+Julia/reviewer note: [`COPC_REVIEW_GUIDE.md`](COPC_REVIEW_GUIDE.md) explains
+why each COPC-specific code path exists, what remains scientifically unchanged,
+and how the differential tests prove the result.
+
 ## Purpose
 
 This execution path reproduces the scientific behavior of the unchanged Julia

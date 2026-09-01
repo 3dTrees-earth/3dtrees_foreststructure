@@ -17,9 +17,18 @@ DTM_CATALOG_SELECTION <- "xyz"
 SEGMENT_CATALOG_BASE_SELECTION <- "xyzrn"
 JULIA_MEMORY_SAFE_SEGMENT_SELECTION <- "xyz"
 
+# COPC stores points in spatial hierarchy order, while the original Julia script
+# implicitly resolves several equal-value ties by input record order.  Sort each
+# independently read chunk by the persisted source ordinal before applying any
+# order-sensitive DTM, CHM, segmentation, or tile operation.  Plain LAS/LAZ runs
+# pass NULL and retain their already-original order without extra work.
 restore_original_point_order <- function(las, point_order_dimension = NULL,
                                          phase = "analysis") {
+  # Preserve the historical path when no key was requested, and avoid touching
+  # genuinely empty chunks returned by LAScatalog edge queries.
   if (is.null(point_order_dimension) || is.empty(las)) return(las)
+  # A missing key means selective reading or COPC construction violated the
+  # canonical input contract; continuing would produce plausible but wrong ties.
   if (!point_order_dimension %in% names(las@data)) {
     stop(sprintf(
       "%s did not load required point-order dimension %s",
@@ -27,7 +36,9 @@ restore_original_point_order <- function(las, point_order_dimension = NULL,
       point_order_dimension
     ))
   }
+  # Pull the key once so validation and sorting use exactly the same values.
   point_order <- las@data[[point_order_dimension]]
+  # Missing or duplicate ordinals make deterministic reconstruction impossible.
   if (anyNA(point_order) || anyDuplicated(point_order)) {
     stop(sprintf(
       "%s received missing or duplicate %s values",
@@ -35,7 +46,9 @@ restore_original_point_order <- function(las, point_order_dimension = NULL,
       point_order_dimension
     ))
   }
+  # Reorder the complete point table so all dimensions remain row-aligned.
   las@data <- las@data[order(point_order), ]
+  # Return the same LAS object shape expected by existing scientific functions.
   las
 }
 
@@ -761,16 +774,20 @@ compute_edge_flags <- function(tiles, tile_size) {
 
 # Disk-backed DTM and CHM pipeline -----------------------------------------
 
+# Process one DTM catalog chunk.  The optional order field is selected by the
+# catalog caller and restored immediately after reading.
 dtm_chunk <- function(chunk, dtm_resolution, ptd_resolution,
                       point_order_dimension = NULL) {
   lidR::set_lidr_threads(1L)
   las <- readLAS(chunk)
   if (is.empty(las)) return(empty_chunk_raster(chunk, dtm_resolution))
+  # Treat a missing order key as a hard error before classification or TIN work.
   assert_loaded_dimensions(
     las,
     c("X", "Y", "Z", "buffer", point_order_dimension),
     "DTM"
   )
+  # Match the record sequence seen by Julia's original LAZ-based workflow.
   las <- restore_original_point_order(las, point_order_dimension, "DTM")
   if (!las_has_nondegenerate_xy(las)) {
     message(
@@ -790,19 +807,30 @@ dtm_chunk <- function(chunk, dtm_resolution, ptd_resolution,
   if (is.null(surface)) empty_chunk_raster(chunk, dtm_resolution) else surface
 }
 
+# Create an in-memory DTM-only LAS representation whose absolute XY coordinates
+# fit lidR's signed-32-bit Delaunay conversion.  Dataset 2011 exposed the failure:
+# micrometre scales combined with ~550 km coordinates overflowed the integer
+# representation.  The source file, COPC, Z values, and non-DTM stages remain
+# untouched; the retry changes only the precision used internally by the TIN.
 tin_compatible_xy_scale <- function(las) {
+  # Read the effective quantization scales from the chunk header.
   xscale <- as.numeric(las@header@PHB[["X scale factor"]])
   yscale <- as.numeric(las@header@PHB[["Y scale factor"]])
+  # Invalid scales cannot be repaired safely because no meaningful precision
+  # baseline exists.
   if (any(!is.finite(c(xscale, yscale))) ||
       any(c(xscale, yscale) <= 0)) {
     stop("LAS header contains invalid XY scale factors")
   }
 
+  # lidR converts absolute coordinates, so safety depends on the largest XY
+  # magnitude rather than on the width or height of the local chunk.
   maximum_coordinate <- max(
     abs(las@data[["X"]]),
     abs(las@data[["Y"]]),
     na.rm = TRUE
   )
+  # Reject all-NA/non-finite input rather than deriving an unusable target scale.
   if (!is.finite(maximum_coordinate)) {
     stop("LAS chunk contains no finite XY coordinates")
   }
@@ -811,20 +839,27 @@ tin_compatible_xy_scale <- function(las) {
   # 32-bit integers. Select the smallest decimal LAS scale that keeps that
   # conversion below 95% of the integer limit, then preserve any coarser input
   # scale. Only this in-memory DTM copy is rescaled; source files are unchanged.
+  # Reserve 5% headroom below INT32_MAX for rounding and boundary behavior.
   minimum_safe_scale <- maximum_coordinate /
     (0.95 * .Machine$integer.max)
+  # Use a decimal LAS scale so the fallback remains conventional and stable
+  # across machines instead of choosing an arbitrary floating-point value.
   decimal_safe_scale <- if (minimum_safe_scale > 0) {
     10^ceiling(log10(minimum_safe_scale))
   } else {
     max(xscale, yscale)
   }
+  # Never claim finer precision than either source axis; one shared XY scale also
+  # avoids anisotropic triangulation artifacts.
   target_scale <- max(xscale, yscale, decimal_safe_scale)
 
+  # Return unchanged when the existing scale is already integer-safe.
   if (isTRUE(all.equal(xscale, target_scale)) &&
       isTRUE(all.equal(yscale, target_scale))) {
     return(las)
   }
 
+  # State explicitly that this is an in-memory DTM retry, not input mutation.
   message(sprintf(
     paste(
       "Rescaling in-memory DTM XY coordinates from %.12g/%.12g m to",
@@ -834,6 +869,8 @@ tin_compatible_xy_scale <- function(las) {
     yscale,
     target_scale
   ))
+  # lidR rewrites the in-memory integer representation while retaining spatial
+  # coordinates at the selected centimetre-or-finer precision.
   las_rescale(
     las,
     xscale = target_scale,
@@ -909,6 +946,8 @@ classified_ground_surface <- function(las, dtm_resolution) {
   tryCatch(
     rasterize_terrain(las, res = dtm_resolution, algorithm = tin()),
     error = function(error) {
+      # Retry only the known lidR integer-conversion failure.  Unrelated TIN
+      # errors must retain their existing behavior and diagnostic path.
       if (grepl(
         "xy coordinates were not converted to integer",
         conditionMessage(error),
@@ -917,7 +956,9 @@ classified_ground_surface <- function(las, dtm_resolution) {
         message(
           "Retrying DTM TIN with an in-memory integer-compatible XY scale"
         )
+        # Rescale a temporary LAS object; the caller's source/chunk is unchanged.
         adjusted <- tin_compatible_xy_scale(las)
+        # Repeat exactly the same terrain algorithm and resolution after repair.
         return(rasterize_terrain(
           adjusted,
           res = dtm_resolution,
@@ -1313,6 +1354,8 @@ cover_virtual_raster <- function(result, point_cloud, resolution,
   covering
 }
 
+# Build the disk-backed global DTM while carrying the COPC order key through
+# lidR's selective catalog reads.
 write_global_dtm <- function(point_cloud, output_path, work_directory,
                              chunk_size, dtm_buffer, dtm_resolution,
                              ptd_resolution, workers, source_crs = NULL,
@@ -1323,6 +1366,7 @@ write_global_dtm <- function(point_cloud, output_path, work_directory,
   catalog <- readLAScatalog(point_cloud)
   opt_chunk_size(catalog) <- chunk_size
   opt_chunk_buffer(catalog) <- dtm_buffer
+  # Plain LAZ requests xyz; canonical COPC adds the OriginalPointIndex ordinal.
   opt_select(catalog) <- catalog_selection_for_dimensions(
     point_cloud,
     point_order_dimension,
@@ -1341,6 +1385,7 @@ write_global_dtm <- function(point_cloud, output_path, work_directory,
       dtm_chunk,
       dtm_resolution = dtm_resolution,
       ptd_resolution = ptd_resolution,
+      # Every worker restores source record order before ground/TIN operations.
       point_order_dimension = point_order_dimension,
       .options = list(
         automerge = FALSE,
@@ -1414,11 +1459,14 @@ build_dtm_overlap_mosaic <- function(chunk_paths, work_directory,
   result
 }
 
+# Process one CHM chunk after restoring the source record sequence when COPC is
+# active.  This retains Julia parity for order-dependent voxel/canopy ties.
 chm_chunk <- function(chunk, dtm_path, voxel_resolution, maximum_height,
                       chm_resolution, point_order_dimension = NULL) {
   lidR::set_lidr_threads(1L)
   las <- readLAS(chunk)
   if (is.empty(las)) return(empty_chunk_raster(chunk, chm_resolution))
+  # Sort before normalization, filtering, voxelization, or canopy rasterization.
   las <- restore_original_point_order(las, point_order_dimension, "CHM")
   las <- normalize_height(las, terra::rast(dtm_path))
   las <- filter_poi(las, is.finite(Z) & Z >= 0 & Z <= maximum_height)
@@ -1428,6 +1476,7 @@ chm_chunk <- function(chunk, dtm_path, voxel_resolution, maximum_height,
   rasterize_canopy(voxels, res = chm_resolution, algorithm = p2r())
 }
 
+# Build the disk-backed CHM and ensure catalog workers receive the order key.
 write_global_chm <- function(point_cloud, dtm_path, output_path, work_directory,
                              chunk_size, voxel_resolution, maximum_height,
                              chm_resolution, workers, source_crs = NULL,
@@ -1438,6 +1487,7 @@ write_global_chm <- function(point_cloud, dtm_path, output_path, work_directory,
   catalog <- readLAScatalog(point_cloud)
   opt_chunk_size(catalog) <- chunk_size
   opt_chunk_buffer(catalog) <- 0
+  # Keep the COPC read spatial/selective while adding only the required key.
   opt_select(catalog) <- catalog_selection_for_dimensions(
     point_cloud,
     point_order_dimension,
@@ -1457,6 +1507,7 @@ write_global_chm <- function(point_cloud, dtm_path, output_path, work_directory,
       voxel_resolution = voxel_resolution,
       maximum_height = maximum_height,
       chm_resolution = chm_resolution,
+      # Each CHM worker sorts only its bounded chunk, never the complete cloud.
       point_order_dimension = point_order_dimension,
       .options = list(
         automerge = FALSE,
@@ -1510,18 +1561,25 @@ segment_catalog_selection <- function(point_cloud, instance_dimensions,
   segment_selection_from_names(available, instance_dimensions, base_selection)
 }
 
+# Convert named ExtraByte requirements into lidR's compact LAS selection syntax.
+# lidR addresses positions 1-9 individually; selector 0 means all ExtraBytes.
 catalog_selection_for_dimensions <- function(point_cloud, dimensions,
                                              base_selection = "xyz") {
+  # NULL becomes character(0); remove absent placeholders passed by LAZ mode.
   dimensions <- dimensions[!is.na(dimensions) & nzchar(dimensions)]
+  # Avoid reading any ExtraByte when the caller needs only standard XYZ fields.
   if (length(dimensions) == 0L) return(base_selection)
+  # Inspect VLR definitions without loading point records.
   header <- readLASheader(point_cloud)
   extra_bytes <- header@VLR$Extra_Bytes[["Extra Bytes Description"]]
   if (is.null(extra_bytes) || length(extra_bytes) == 0L) {
     stop("requested catalog ExtraByte dimensions are absent")
   }
+  # Preserve declared ordinal order because selectors are position-based.
   available <- vapply(extra_bytes, function(description) {
     as.character(description$name)
   }, character(1))
+  # A missing required field would make later order restoration/science unsafe.
   missing <- setdiff(dimensions, available)
   if (length(missing) > 0L) {
     stop(sprintf(
@@ -1529,8 +1587,11 @@ catalog_selection_for_dimensions <- function(point_cloud, dimensions,
       paste(missing, collapse = ", ")
     ))
   }
+  # Translate names to one-based lidR ExtraByte selector positions.
   positions <- unique(match(dimensions, available))
+  # Position 0 requests all ExtraBytes when any requirement lies beyond 9.
   if (any(positions > 9L)) return(paste0(base_selection, "0"))
+  # Concatenate individual positions for the minimal selective read.
   paste0(base_selection, paste(positions, collapse = ""))
 }
 
@@ -1592,6 +1653,8 @@ write_segment_chunk_store <- function(voxels, layers, apex, work_directory,
   paths
 }
 
+# Read and aggregate one bounded segmentation chunk.  COPC order restoration is
+# intentionally performed before instance filtering and apex tie-breaking.
 segment_chunk <- function(chunk, dtm_path, voxel_resolution, maximum_height,
                           instance_dimensions, work_directory, bucket_count,
                           strict_dimensions = FALSE,
@@ -1602,6 +1665,7 @@ segment_chunk <- function(chunk, dtm_path, voxel_resolution, maximum_height,
     if (!chunk_has_valid_extent(chunk)) return(NULL)
     return(list(paths = NULL))
   }
+  # Recover original LAZ record order inside this spatially streamed chunk.
   las <- restore_original_point_order(
     las,
     point_order_dimension,
@@ -1612,6 +1676,7 @@ segment_chunk <- function(chunk, dtm_path, voxel_resolution, maximum_height,
       las,
       c(
         "X", "Y", "Z", "buffer", instance_dimensions,
+        # Strict COPC mode proves that selector construction loaded the key too.
         point_order_dimension
       ),
       "segment"
@@ -1662,6 +1727,8 @@ segment_chunk <- function(chunk, dtm_path, voxel_resolution, maximum_height,
   list(paths = do.call(c, dimension_paths))
 }
 
+# Configure a spatially streamed segment catalog.  The order key travels beside
+# requested instance dimensions but is not included in scientific aggregation.
 accumulate_segments <- function(point_cloud, dtm_path, chunk_size,
                                 voxel_resolution, maximum_height,
                                 instance_dimensions, workers, work_directory,
@@ -1672,6 +1739,7 @@ accumulate_segments <- function(point_cloud, dtm_path, chunk_size,
   catalog <- readLAScatalog(point_cloud)
   opt_chunk_size(catalog) <- chunk_size
   opt_chunk_buffer(catalog) <- 0
+  # Request both the segmentation values and source-row order in one COPC scan.
   selection <- segment_catalog_selection(
     point_cloud,
     c(instance_dimensions, point_order_dimension),
@@ -1699,6 +1767,7 @@ accumulate_segments <- function(point_cloud, dtm_path, chunk_size,
         base_selection,
         JULIA_MEMORY_SAFE_SEGMENT_SELECTION
       ),
+      # The worker uses this only to sort its in-memory bounded chunk.
       point_order_dimension = point_order_dimension,
       .options = list(automerge = FALSE, drop_null = FALSE)
     )
@@ -2084,6 +2153,8 @@ safe_round <- function(value, digits = 4) {
   round(as.numeric(value[[1]]), digits)
 }
 
+# Calculate Julia-compatible tile metrics from a spatial window.  COPC still
+# supplies only the requested window; order restoration occurs after that read.
 calculate_tile_metrics <- function(point_cloud, tile, dtm, parameters) {
   bounds <- st_bbox(tile)
   voxel_total <- round(
@@ -2095,6 +2166,7 @@ calculate_tile_metrics <- function(point_cloud, tile, dtm, parameters) {
 
   las <- readLAS(
     point_cloud,
+    # Add OriginalPointIndex to XYZ only when the active input is canonical COPC.
     select = catalog_selection_for_dimensions(
       point_cloud,
       parameters$point_order_dimension,
@@ -2106,11 +2178,13 @@ calculate_tile_metrics <- function(point_cloud, tile, dtm, parameters) {
     )
   )
   if (is.empty(las)) return(empty)
+  # Fail closed if selective COPC reading omitted the required order key.
   assert_loaded_dimensions(
     las,
     c("X", "Y", "Z", parameters$point_order_dimension),
     "tile"
   )
+  # Match the point sequence used by the original Julia tile calculations.
   las <- restore_original_point_order(
     las,
     parameters$point_order_dimension,
@@ -2512,6 +2586,7 @@ run_analysis <- function(parameters) {
   parameters$dimension_point_clouds <- parameter_or(
     parameters, "dimension_point_clouds", list()
   )
+  # NULL retains original LAZ behavior; COPC runners provide OriginalPointIndex.
   parameters$point_order_dimension <- parameter_or(
     parameters, "point_order_dimension", NULL
   )
@@ -2593,6 +2668,7 @@ run_analysis <- function(parameters) {
     parameters$ptd_resolution,
     catalog_workers,
     source_crs,
+    # Propagate the key through DTM catalog selection and per-chunk restoration.
     parameters$point_order_dimension
   )
   dtm <- terra::rast(dtm_path)
@@ -2620,6 +2696,7 @@ run_analysis <- function(parameters) {
     parameters$chm_resolution,
     catalog_workers,
     source_crs,
+    # Propagate the same key through CHM selection and per-chunk restoration.
     parameters$point_order_dimension
   )
   chm_seconds <- elapsed_seconds(chm_started)
@@ -2667,6 +2744,7 @@ run_analysis <- function(parameters) {
           dimension_directory,
           bucket_count = parameters$segment_bucket_count,
           base_selection = parameters$segment_catalog_base_selection,
+          # Restore source order separately in each dimension's COPC pass.
           point_order_dimension = parameters$point_order_dimension
         )
         dimension_segments <- if (is.null(accumulated)) {
@@ -2706,6 +2784,7 @@ run_analysis <- function(parameters) {
         segment_work_directory,
         bucket_count = parameters$segment_bucket_count,
         base_selection = parameters$segment_catalog_base_selection,
+        # Restore source order in the combined legacy segmentation pass too.
         point_order_dimension = parameters$point_order_dimension
       )
       segments <- if (is.null(accumulated)) {

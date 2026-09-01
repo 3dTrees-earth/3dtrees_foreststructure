@@ -26,6 +26,8 @@ test-julia-memory-safe:
 	FORESTSTRUCTURE_JULIA_IMAGE="$(JULIA_MEMORY_SAFE_IMAGE)" \
 	bash tests/test_julia_memory_safe.sh
 
+# Differential fixture acceptance: ordered LAZ and canonical COPC must match for
+# PredInstance, PredInstance_SAT, and PredInstance_FM under identical resources.
 test-copc-all-instance-dimensions:
 	FORESTSTRUCTURE_JULIA_IMAGE="$(JULIA_MEMORY_SAFE_IMAGE)" \
 	bash tests/test_copc_all_instance_dimensions.sh
@@ -47,6 +49,8 @@ test-julia-memory-safe-dataset150-operational-aoi:
 		"$(DATASET150_OPERATIONAL_AOI)" \
 		"$(JULIA_ORIGINAL_SCRIPT)"
 
+# Dataset acceptance: run canonical COPC, prove COPC provenance, then compare all
+# scientific tables/vectors/rasters against the supplied Julia-faithful oracle.
 test-valid-updated-copc-alignment:
 	FORESTSTRUCTURE_JULIA_IMAGE="$(JULIA_MEMORY_SAFE_IMAGE)" \
 	bash tests/test_valid_updated_copc_alignment.sh \
@@ -57,6 +61,8 @@ test-valid-updated-copc-alignment:
 		"$(INSTANCE_DIMENSION)" \
 		"$(ORIGINAL_LAZ)"
 
+# Canonical conversion: add OriginalPointIndex, build spatial COPC with Untwine,
+# validate point identity/index completeness, and publish only after validation.
 build-original-order-copc:
 	FORESTSTRUCTURE_JULIA_IMAGE="$(JULIA_MEMORY_SAFE_IMAGE)" \
 	bash tests/build_original_order_copc.sh \

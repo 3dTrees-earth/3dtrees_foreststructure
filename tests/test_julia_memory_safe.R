@@ -54,7 +54,15 @@ stopifnot(beyond_nine)
 dtm_body <- paste(deparse(body(dtm_chunk)), collapse = "\n")
 stopifnot(grepl("last_returns = FALSE", dtm_body, fixed = TRUE))
 tile_body <- paste(deparse(body(calculate_tile_metrics)), collapse = "\n")
-stopifnot(grepl('select = "xyz"', tile_body, fixed = TRUE))
+# Tile reads must stay spatial/selective while requesting OriginalPointIndex in
+# COPC mode; checking a literal ``select = "xyz"`` would enforce the old LAZ-only
+# implementation and prevent deterministic order restoration.
+stopifnot(grepl(
+  "catalog_selection_for_dimensions",
+  tile_body,
+  fixed = TRUE
+))
+stopifnot(grepl("restore_original_point_order", tile_body, fixed = TRUE))
 segment_body <- paste(deparse(body(accumulate_segments)), collapse = "\n")
 stopifnot(!grepl('select = "*"', segment_body, fixed = TRUE))
 stopifnot(!grepl('readLAS(point_cloud)', segment_body, fixed = TRUE))

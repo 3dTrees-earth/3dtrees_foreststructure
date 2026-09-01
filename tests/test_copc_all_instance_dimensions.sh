@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
+# Treat every failed command, unset variable, or pipeline component as failure.
 set -euo pipefail
 
+# Resolve repository helpers without depending on the invocation directory.
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Pin/override the two images involved in analysis and canonical COPC creation.
 image_name="${FORESTSTRUCTURE_JULIA_IMAGE:-3dtrees-foreststructure:copc-local}"
 smart_tile_image="${FORESTSTRUCTURE_SMART_TILE_IMAGE:-3dtrees-smart-tile:34f492a-v2.3.1}"
+# Isolate all generated fixtures, work files, and outputs in one private root.
 test_root="$(mktemp -d)"
+# Preserve evidence only when explicitly requested during debugging.
 cleanup() {
   if [[ "${FORESTSTRUCTURE_KEEP_TEST_ROOT:-0}" == "1" ]]; then
     echo "Preserving test root: ${test_root}"
@@ -12,8 +17,10 @@ cleanup() {
     rm -rf "${test_root}"
   fi
 }
+# Ensure normal exits, failures, and signals all follow the same cleanup policy.
 trap cleanup EXIT
 echo "COPC all-dimension test root: ${test_root}"
+# Separate immutable inputs from ordered-LAZ and COPC execution outputs/work.
 mkdir -p \
   "${test_root}/input" \
   "${test_root}/ordered-output" \
@@ -21,6 +28,7 @@ mkdir -p \
   "${test_root}/copc-output" \
   "${test_root}/copc-work"
 
+# Generate a deterministic fixture in which all three instance dimensions differ.
 docker run --rm --network none \
   --user "$(id -u):$(id -g)" \
   --entrypoint Rscript \
@@ -30,6 +38,7 @@ docker run --rm --network none \
   /tests/generate_julia_memory_safe_fixture.R \
   /generated/distinct.laz /generated/aoi.geojson distinct-dimensions
 
+# Convert that ordered LAZ to canonical COPC under a small regression-test budget.
 FORESTSTRUCTURE_JULIA_IMAGE="${image_name}" \
 FORESTSTRUCTURE_SMART_TILE_IMAGE="${smart_tile_image}" \
 FORESTSTRUCTURE_TEST_CPUS=2 \
@@ -39,13 +48,18 @@ FORESTSTRUCTURE_TEST_MEMORY_GIB=4 \
   "${test_root}/input/distinct.copc.laz" \
   "${test_root}/input/order-validation.json"
 
+# Run one ForestStructure input through an identical resource/science envelope.
 run_foreststructure() {
+  # The first three arguments identify input, published output, and scratch work.
   local point_cloud="$1"
   local output_dir="$2"
   local work_dir="$3"
   local point_cloud_name
+  # All fixture files share one read-only mount, so pass only the basename inside.
   point_cloud_name="$(basename "${point_cloud}")"
+  # Remaining arguments carry COPC-only options such as the original companion.
   shift 3
+  # Network isolation and hard CPU/memory limits keep the test deterministic.
   docker run --rm --network none \
     --cpus 2 \
     --memory 4g \
@@ -66,11 +80,13 @@ run_foreststructure() {
     --memory-budget-gib 3
 }
 
+# First produce the ordered-LAZ oracle using the same candidate implementation.
 run_foreststructure \
   "${test_root}/input/distinct.laz" \
   "${test_root}/ordered-output" \
   "${test_root}/ordered-work" \
   2>&1 | tee "${test_root}/ordered.log"
+# Then process canonical COPC while supplying LAZ only as identity evidence.
 run_foreststructure \
   "${test_root}/input/distinct.copc.laz" \
   "${test_root}/copc-output" \
@@ -78,6 +94,7 @@ run_foreststructure \
   --original-point-cloud /in/distinct.laz \
   2>&1 | tee "${test_root}/copc.log"
 
+# Require byte identity for every tabular/vector artifact in all three dimensions.
 for dimension in PredInstance PredInstance_SAT PredInstance_FM; do
   for artifact in results.csv segment_diagnostics.csv tiles.geojson; do
     cmp \
@@ -85,18 +102,22 @@ for dimension in PredInstance PredInstance_SAT PredInstance_FM; do
       "${test_root}/copc-output/150_${dimension}_${artifact}"
   done
 done
+# DTM and CHM must also be byte-identical between ordered LAZ and COPC.
 for raster in dtm.tif chm.tif; do
   cmp \
     "${test_root}/ordered-output/150_${raster}" \
     "${test_root}/copc-output/150_${raster}"
 done
 
+# Guard fixture quality: distinct dimension inputs must not collapse to the same
+# results, otherwise the equality checks above would not prove dimension routing.
 if cmp -s \
   "${test_root}/copc-output/150_PredInstance_results.csv" \
   "${test_root}/copc-output/150_PredInstance_SAT_results.csv"; then
   echo "PredInstance and PredInstance_SAT unexpectedly produced identical results" >&2
   exit 1
 fi
+# Apply the same fixture-quality guard to SAT versus foundation-model values.
 if cmp -s \
   "${test_root}/copc-output/150_PredInstance_SAT_results.csv" \
   "${test_root}/copc-output/150_PredInstance_FM_results.csv"; then
@@ -104,6 +125,7 @@ if cmp -s \
   exit 1
 fi
 
+# Verify that provenance records COPC mode, order restoration, and all dimensions.
 jq -e '
   .requested_is_copc == true and
   .point_order_dimension == "OriginalPointIndex" and
@@ -112,4 +134,5 @@ jq -e '
   ]
 ' "${test_root}/copc-output/150_julia_memory_safe_run.json" >/dev/null
 
+# Reach this line only after both differential science and provenance checks pass.
 echo "COPC all-instance-dimension differential acceptance passed"

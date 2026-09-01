@@ -1,6 +1,10 @@
+# Extend Julia's released ForestStructure image instead of changing its pinned
+# R/lidR/GDAL scientific environment.
 ARG BASE_IMAGE=3dtrees-foreststructure:v0.1.2
 FROM ${BASE_IMAGE}
 
+# Embed build identity and pin the two Python packages used only by conversion
+# helpers and ExtraByte projection/validation.
 ARG VCS_REF=unknown
 ARG IMAGE_VERSION=julia-memory-safe-local
 ARG LASPY_VERSION=2.6.1
@@ -11,6 +15,8 @@ ARG LAZRS_VERSION=0.7.0
 # historical form of this Dockerfile at revision 11d5631. See DOCKER.md for
 # exact image identities, resource profiles and the three-way comparison.
 
+# Install no recommended system extras, remove apt metadata, and pin Python LAS
+# readers so local, CI, and production images interpret ExtraBytes identically.
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends python3-pip \
     && rm -rf /var/lib/apt/lists/* \
@@ -19,9 +25,14 @@ RUN apt-get update \
       "lazrs==${LAZRS_VERSION}" \
     && python3 -c 'import laspy, lazrs; assert laspy.__version__ == "2.6.1"'
 
+# Replace only the ForestStructure runner sources; the base scientific stack is
+# intentionally inherited unchanged from v0.1.2.
 COPY src /opt/foreststructure
+# Permit arbitrary host UIDs to execute/read the copied sources in restricted runs.
 RUN chmod -R a+rX /opt/foreststructure
 
+# Labels make the COPC/order/resource contract inspectable without starting the
+# image and preserve a direct link back to the exact reviewed source revision.
 LABEL org.opencontainers.image.source="https://github.com/3dTrees-earth/3dtrees_foreststructure" \
       org.opencontainers.image.title="3Dtrees ForestStructure ordered-COPC" \
       org.opencontainers.image.description="Julia-parity forest metrics with COPC spatial streaming and OriginalPointIndex order restoration" \
@@ -37,4 +48,6 @@ LABEL org.opencontainers.image.source="https://github.com/3dTrees-earth/3dtrees_
       earth.3dtrees.reference.sha256="746d57b4c937001af31e4ccd1b9f14edb5cebb15d46154ad9e20d0ce39f78226" \
       earth.3dtrees.instance-dimensions="PredInstance,PredInstance_SAT,PredInstance_FM"
 
+# Keep one explicit entry point so every run receives the same validation,
+# provenance, atomic-promotion, and COPC-order-restoration guards.
 ENTRYPOINT ["Rscript", "/opt/foreststructure/run_julia_memory_safe.R"]
