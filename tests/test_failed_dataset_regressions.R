@@ -17,19 +17,40 @@ stopifnot(identical(DTM_CATALOG_SELECTION, "xyz"))
 fine_scale_las <- LAS(data.frame(
   X = c(226990.0000001, 226991.0000002, 226990.5000003),
   Y = c(378990.0000001, 378990.5000002, 378991.0000003),
-  Z = c(357, 358, 359)
+  Z = c(357, 358, 359),
+  Classification = rep(2L, 3L)
 ))
 fine_scale_las@header@PHB[["X scale factor"]] <- 1e-7
 fine_scale_las@header@PHB[["Y scale factor"]] <- 1e-7
-tin_safe_las <- tin_compatible_xy_scale(fine_scale_las)
-stopifnot(isTRUE(all.equal(
-  as.numeric(tin_safe_las@header@PHB[["X scale factor"]]),
-  0.001
-)))
-stopifnot(isTRUE(all.equal(
-  as.numeric(tin_safe_las@header@PHB[["Y scale factor"]]),
-  0.001
-)))
+# The explicit fallback must execute lidR's legacy floating-point triangulation
+# directly and leave the source LAS quantization metadata unchanged.
+fine_scale_header_before <- fine_scale_las@header@PHB
+legacy_surface <- rasterize_terrain(
+  fine_scale_las,
+  res = 1,
+  algorithm = legacy_tin()
+)
+stopifnot(inherits(legacy_surface, "SpatRaster"))
+stopifnot(identical(fine_scale_las@header@PHB, fine_scale_header_before))
+
+# With unequal XY scales, lidR selects its own legacy branch before attempting
+# integer triangulation. Its raster must match the explicit retry implementation.
+automatic_slow_las <- fine_scale_las
+automatic_slow_las@header@PHB[["Y scale factor"]] <- 1e-6
+automatic_slow_surface <- suppressMessages(rasterize_terrain(
+  automatic_slow_las,
+  res = 0.25,
+  algorithm = tin()
+))
+explicit_slow_surface <- rasterize_terrain(
+  fine_scale_las,
+  res = 0.25,
+  algorithm = legacy_tin()
+)
+stopifnot(identical(
+  terra::values(explicit_slow_surface, mat = FALSE),
+  terra::values(automatic_slow_surface, mat = FALSE)
+))
 dtm_body <- paste(deparse(body(write_global_dtm)), collapse = "\n")
 stopifnot(grepl(
   "catalog_selection_for_dimensions",

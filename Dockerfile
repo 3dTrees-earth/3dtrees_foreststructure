@@ -37,6 +37,7 @@ LABEL org.opencontainers.image.source="https://github.com/3dTrees-earth/3dtrees_
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.version="${IMAGE_VERSION}" \
       earth.3dtrees.algorithm-base.revision="9d1fba9cb14adac51336ee53b4f5f5535395331a" \
+      earth.3dtrees.dtm-tin-retry="legacy-floating-point" \
       earth.3dtrees.instance-dimensions="PredInstance,PredInstance_SAT,PredInstance_FM"
 
 COPY src /opt/foreststructure

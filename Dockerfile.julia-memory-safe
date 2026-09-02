@@ -41,6 +41,7 @@ LABEL org.opencontainers.image.source="https://github.com/3dTrees-earth/3dtrees_
       earth.3dtrees.lidr.version="4.3.2" \
       earth.3dtrees.memory-budget.max-gib="70" \
       earth.3dtrees.execution-mode="julia-memory-safe" \
+      earth.3dtrees.dtm-tin-retry="legacy-floating-point" \
       earth.3dtrees.input-mode="original-las-or-canonical-ordered-copc" \
       earth.3dtrees.point-order="OriginalPointIndex" \
       earth.3dtrees.reference.sha256="746d57b4c937001af31e4ccd1b9f14edb5cebb15d46154ad9e20d0ce39f78226" \

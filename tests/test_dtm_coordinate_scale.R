@@ -11,10 +11,11 @@ las <- las_rescale(las, xscale = 0.00025, yscale = 0.00025, zscale = 0.001)
 
 # Julia's upstream implementation passes the classified LAS directly to TIN.
 # Preserve that first attempt, but retry the specific lidR integer-conversion
-# failure seen with very fine production scales using an in-memory copy.
-stopifnot(exists("tin_compatible_xy_scale", inherits = FALSE))
+# failure with the legacy floating-point TIN and the unchanged LAS coordinates.
+stopifnot(exists("legacy_tin", inherits = FALSE))
 surface_body <- paste(deparse(body(classified_ground_surface)), collapse = "\n")
-stopifnot(grepl("tin_compatible_xy_scale", surface_body, fixed = TRUE))
+stopifnot(grepl("legacy_tin", surface_body, fixed = TRUE))
+stopifnot(!grepl("tin_compatible_xy_scale", surface_body, fixed = TRUE))
 
 coordinates_before <- las@data[, c("X", "Y")]
 scale_before <- unlist(las@header@PHB[c("X scale factor", "Y scale factor")])
@@ -51,3 +52,38 @@ stopifnot(identical(
   unlist(fine_las@header@PHB[c("X scale factor", "Y scale factor")]),
   fine_scale_before
 ))
+
+# Exercise the exact error-dispatch seam deterministically. The first mocked
+# rasterization represents lidR's optimized integer TIN failure; the second
+# call must receive the explicit legacy algorithm without changing the LAS.
+original_rasterize_terrain <- rasterize_terrain
+original_legacy_tin <- legacy_tin
+on.exit({
+  rasterize_terrain <- original_rasterize_terrain
+  legacy_tin <- original_legacy_tin
+}, add = TRUE)
+rasterize_calls <- 0L
+legacy_retry_called <- FALSE
+legacy_tin <- function(...) {
+  legacy_retry_called <<- TRUE
+  original_legacy_tin(...)
+}
+rasterize_terrain <- function(las, res, algorithm) {
+  rasterize_calls <<- rasterize_calls + 1L
+  if (rasterize_calls == 1L) {
+    stop(paste(
+      "Internal error in C_interpolate_delaunay:",
+      "xy coordinates were not converted to integer"
+    ))
+  }
+  force(algorithm)
+  "legacy-retry-result"
+}
+retry_coordinates_before <- fine_las@data[, c("X", "Y")]
+retry_header_before <- fine_las@header@PHB
+retry_result <- classified_ground_surface(fine_las, 1)
+stopifnot(identical(retry_result, "legacy-retry-result"))
+stopifnot(rasterize_calls == 2L)
+stopifnot(legacy_retry_called)
+stopifnot(identical(fine_las@data[, c("X", "Y")], retry_coordinates_before))
+stopifnot(identical(fine_las@header@PHB, retry_header_before))

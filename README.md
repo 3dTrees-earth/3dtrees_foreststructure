@@ -13,6 +13,11 @@ The unchanged scientific reference is
 [`reference/Indices_Final_run.R`](reference/Indices_Final_run.R), SHA-256
 `746d57b4c937001af31e4ccd1b9f14edb5cebb15d46154ad9e20d0ce39f78226`.
 
+DTM generation first uses lidR's optimized integer TIN. If that implementation
+rejects coordinates that do not match the LAS scale/offset integer grid, the
+same chunk is retried with lidR 4.3.2's legacy floating-point TIN. The fallback
+does not rescale coordinates or modify the LAS header.
+
 ## Build
 
 Build the base image and the ordered-COPC image:

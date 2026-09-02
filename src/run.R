@@ -807,75 +807,53 @@ dtm_chunk <- function(chunk, dtm_resolution, ptd_resolution,
   if (is.null(surface)) empty_chunk_raster(chunk, dtm_resolution) else surface
 }
 
-# Create an in-memory DTM-only LAS representation whose absolute XY coordinates
-# fit lidR's signed-32-bit Delaunay conversion.  Dataset 2011 exposed the failure:
-# micrometre scales combined with ~550 km coordinates overflowed the integer
-# representation.  The source file, COPC, Z values, and non-DTM stages remain
-# untouched; the retry changes only the precision used internally by the TIN.
-tin_compatible_xy_scale <- function(las) {
-  # Read the effective quantization scales from the chunk header.
-  xscale <- as.numeric(las@header@PHB[["X scale factor"]])
-  yscale <- as.numeric(las@header@PHB[["Y scale factor"]])
-  # Invalid scales cannot be repaired safely because no meaningful precision
-  # baseline exists.
-  if (any(!is.finite(c(xscale, yscale))) ||
-      any(c(xscale, yscale) <= 0)) {
-    stop("LAS header contains invalid XY scale factors")
+# Build the same floating-point Delaunay algorithm that lidR 4.3.2 uses when
+# its optimized integer path rejects a LAS scale, offset, or coordinate. Calling
+# the legacy primitives explicitly makes the retry independent of lidR's sampled
+# fast-path precheck and preserves every source coordinate and header value.
+legacy_tin <- function(..., extrapolate = knnidw(3, 1, 50)) {
+  # Resolve the extrapolation algorithm once, matching lidR::tin() semantics.
+  extrapolate <- lazyeval::uq(extrapolate)
+  # Define the DTM plugin callback that receives one LAS chunk and raster grid.
+  algorithm <- function(las, where) {
+    # A numeric matrix forces tDelaunay() onto its legacy floating-point branch.
+    points <- as.matrix(las@data)
+    # tInterpolate() expects candidate raster locations as a numeric XY matrix.
+    query <- as.matrix(where)
+    # lidR 4.3.2 drops matrix dimensions inside tInterpolate() for one query.
+    single_query <- nrow(query) == 1L
+    # Duplicate that one location solely to retain matrix shape in the legacy API.
+    interpolation_query <- if (single_query) rbind(query, query) else query
+    # Build the legacy triangulation without changing LAS coordinates or headers.
+    triangulation <- lidR:::tDelaunay(points, trim = 0)
+    # Interpolate grid elevations with the configured lidR thread allowance.
+    elevations <- lidR:::tInterpolate(
+      triangulation,
+      points,
+      interpolation_query,
+      threads = lidR::get_lidr_threads()
+    )
+    # Discard the duplicate result introduced only for the one-cell API guard.
+    if (single_query) elevations <- elevations[[1L]]
+    # Find grid cells outside the convex hull, which Delaunay leaves as NA.
+    outside <- is.na(elevations)
+    # Preserve lidR::tin()'s configured nearest-neighbour extrapolation behavior.
+    if (any(outside)) {
+      # Tell the extrapolation plugin that it runs in spatial-interpolation mode.
+      lidR.context <- "spatial_interpolation"
+      # Pass only unresolved XY cells to avoid repeating successful interpolation.
+      outside_coordinates <- data.frame(
+        X = where$X[outside],
+        Y = where$Y[outside]
+      )
+      # Fill outside-hull cells with the same default used by lidR::tin().
+      elevations[outside] <- extrapolate(las, outside_coordinates)
+    }
+    # Return one elevation per requested raster location to the DTM plugin.
+    elevations
   }
-
-  # lidR converts absolute coordinates, so safety depends on the largest XY
-  # magnitude rather than on the width or height of the local chunk.
-  maximum_coordinate <- max(
-    abs(las@data[["X"]]),
-    abs(las@data[["Y"]]),
-    na.rm = TRUE
-  )
-  # Reject all-NA/non-finite input rather than deriving an unusable target scale.
-  if (!is.finite(maximum_coordinate)) {
-    stop("LAS chunk contains no finite XY coordinates")
-  }
-
-  # lidR's Delaunay implementation converts absolute XY coordinates to signed
-  # 32-bit integers. Select the smallest decimal LAS scale that keeps that
-  # conversion below 95% of the integer limit, then preserve any coarser input
-  # scale. Only this in-memory DTM copy is rescaled; source files are unchanged.
-  # Reserve 5% headroom below INT32_MAX for rounding and boundary behavior.
-  minimum_safe_scale <- maximum_coordinate /
-    (0.95 * .Machine$integer.max)
-  # Use a decimal LAS scale so the fallback remains conventional and stable
-  # across machines instead of choosing an arbitrary floating-point value.
-  decimal_safe_scale <- if (minimum_safe_scale > 0) {
-    10^ceiling(log10(minimum_safe_scale))
-  } else {
-    max(xscale, yscale)
-  }
-  # Never claim finer precision than either source axis; one shared XY scale also
-  # avoids anisotropic triangulation artifacts.
-  target_scale <- max(xscale, yscale, decimal_safe_scale)
-
-  # Return unchanged when the existing scale is already integer-safe.
-  if (isTRUE(all.equal(xscale, target_scale)) &&
-      isTRUE(all.equal(yscale, target_scale))) {
-    return(las)
-  }
-
-  # State explicitly that this is an in-memory DTM retry, not input mutation.
-  message(sprintf(
-    paste(
-      "Rescaling in-memory DTM XY coordinates from %.12g/%.12g m to",
-      "%.12g m for lidR TIN integer compatibility; source data are unchanged"
-    ),
-    xscale,
-    yscale,
-    target_scale
-  ))
-  # lidR rewrites the in-memory integer representation while retaining spatial
-  # coordinates at the selected centimetre-or-finer precision.
-  las_rescale(
-    las,
-    xscale = target_scale,
-    yscale = target_scale
-  )
+  # Mark the callback as a lidR DTM algorithm with threaded interpolation support.
+  lidR:::plugin_dtm(algorithm, omp = TRUE)
 }
 
 las_has_nondegenerate_xy <- function(las) {
@@ -954,15 +932,16 @@ classified_ground_surface <- function(las, dtm_resolution) {
         fixed = TRUE
       )) {
         message(
-          "Retrying DTM TIN with an in-memory integer-compatible XY scale"
+          paste(
+            "Retrying DTM TIN with lidR's legacy floating-point implementation;",
+            "coordinates and header are unchanged"
+          )
         )
-        # Rescale a temporary LAS object; the caller's source/chunk is unchanged.
-        adjusted <- tin_compatible_xy_scale(las)
-        # Repeat exactly the same terrain algorithm and resolution after repair.
+        # Repeat the same DTM resolution with the original LAS and slow TIN path.
         return(rasterize_terrain(
-          adjusted,
+          las,
           res = dtm_resolution,
-          algorithm = tin()
+          algorithm = legacy_tin()
         ))
       }
       if (grepl(

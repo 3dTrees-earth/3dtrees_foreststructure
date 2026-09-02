@@ -13,10 +13,10 @@ by the original Julia/R workflow. Some lidR operations resolve ties using input
 order, so feeding a generic COPC can change a small number of downstream values
 even when every XYZ and instance value survived conversion.
 
-A second, independent failure occurs in lidR's DTM TIN path when large absolute
-coordinates use extremely fine LAS scales. The Delaunay implementation converts
-absolute XY coordinates to signed 32-bit integers. Dataset 2011, for example,
-used 0.000001 m scales around easting 550,000 m and failed with:
+A second, independent failure occurs in lidR's optimized DTM TIN path when an
+XY coordinate cannot be represented by the LAS header's scale and offset as a
+signed 32-bit integer. Dataset 2011, for example, used 0.000001 m scales around
+easting 550,000 m and failed with:
 
 ```text
 Internal error in C_interpolate_delaunay: xy coordinates were not converted to integer.
@@ -106,13 +106,14 @@ to its geometry and scientific instance value without assuming physical order.
 - DTM, CHM, segment, and tile functions receive the order key explicitly. There
   is no hidden global COPC mode.
 - Plain LAS/LAZ passes `NULL`, so its established order and behavior are unchanged.
-- `tin_compatible_xy_scale()` retries only the known lidR Delaunay integer-scale
-  error. It calculates the smallest decimal scale that keeps absolute XY below
-  95% of `INT32_MAX`, never chooses finer precision than the source, and changes
-  only the in-memory DTM retry object.
+- `legacy_tin()` retries only the known lidR Delaunay integer-conversion error.
+  It explicitly uses lidR 4.3.2's floating-point `tDelaunay()` and
+  `tInterpolate()` path with the original LAS coordinates and header.
 
-The DTM retry does not rewrite the source LAS/LAZ or COPC. It does not alter Z,
-segmentation, CHM input storage, or the configured DTM algorithm/resolution.
+The DTM retry does not rescale or rewrite the source LAS/LAZ or COPC. It does
+not alter XY, Z, segmentation, CHM input storage, or the configured DTM
+resolution. It changes only the implementation used to complete the failed
+Delaunay interpolation and preserves `tin()`'s outside-hull extrapolation.
 
 ### `tests/test_copc_all_instance_dimensions.sh`
 
