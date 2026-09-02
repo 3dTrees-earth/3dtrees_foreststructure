@@ -18,6 +18,16 @@ rejects coordinates that do not match the LAS scale/offset integer grid, the
 same chunk is retried with lidR 4.3.2's legacy floating-point TIN. The fallback
 does not rescale coordinates or modify the LAS header.
 
+A real replay of dataset 2153 (`8101.laz`, 40,453,840 points) reproduced the
+historical integer-conversion failure with the old image and completed with the
+legacy retry under 10 CPUs and a 30 GiB limit. The accepted run used 6.25 GiB
+peak cgroup memory and produced all 12 expected artifacts. This proves failure
+recovery, but not zero-tolerance `valid_updated` parity: dataset 2153 has no
+confirmed oracle in the validation cohort, and comparison with its older
+generic-COPC result found small raster and segment differences. See
+[`COPC_REVIEW_GUIDE.md`](COPC_REVIEW_GUIDE.md) and the machine-readable
+validation record in `benchmarks/results/` before promoting this retry strategy.
+
 ## Build
 
 Build the base image and the ordered-COPC image:

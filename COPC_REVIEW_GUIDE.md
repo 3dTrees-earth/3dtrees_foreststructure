@@ -167,7 +167,7 @@ input validation/provenance, and a narrowly matched DTM error recovery path.
 ## Acceptance evidence
 
 The automated differential fixture covers `PredInstance`, `PredInstance_SAT`,
-and `PredInstance_FM`. The real failed-dataset replay used dataset 2011:
+and `PredInstance_FM`. The ordered-COPC replay used dataset 2011:
 
 - 23,700,806 source points;
 - every `OriginalPointIndex` present exactly once;
@@ -182,6 +182,36 @@ Dataset 2011 had no previously promoted `valid_updated` artifact because its old
 run failed at DTM. Therefore its reference was generated fresh from the ordered
 original LAZ with the same patched scientific implementation. This isolates the
 COPC conversion/order-restoration path while exercising the exact former failure.
+
+### Legacy-TIN retry replay
+
+The legacy floating-point retry introduced after that ordered-COPC validation
+was replayed separately on dataset 2153 on 2026-09-02:
+
+- Input `8101.laz` contained 40,453,840 points in 220,297,505 bytes; SHA-256
+  `7bca4ef1fe055ab5f1a826050d0c85330f7f17fc4cd99580769ab0d08656a346`.
+- The historical image reproduced the exact
+  `C_interpolate_delaunay: xy coordinates were not converted to integer`
+  failure during DTM and exited with status 1.
+- The slow-retry image logged the legacy floating-point fallback, completed
+  DTM, passed internal validation, and atomically promoted 12 artifacts.
+- The controlled run used 10 CPUs, one LAScatalog worker, a 30 GiB hard limit,
+  and a 25 GiB internal budget. Analysis took 465.808 seconds, including
+  127.044 seconds for DTM, and peak cgroup memory was 6,249.4 MiB.
+
+This replay proves that the slow retry recovers a real former failure without
+rescaling XY. It is not a zero-tolerance `valid_updated` acceptance result:
+dataset 2153 is absent from the confirmed oracle cohort. A diagnostic comparison
+with its previously promoted generic-COPC result retained identical raster
+geometry and populated masks but found 800 differing DTM cells (mean absolute
+difference 0.0002 m, maximum 0.0282 m), two differing CHM cells (maximum
+0.2 m), 42 differing SAT segment fields, and 63 differing FM segment fields.
+That comparison also changes input order and runtime concurrency, so it cannot
+attribute the differences solely to the TIN implementation. A confirmed
+`valid_updated` oracle replay remains required before production promotion.
+
+The complete structured evidence is stored in
+`benchmarks/results/2026-09-02-dataset2153-slow-tin-validation.json`.
 
 ## Reviewer commands
 
