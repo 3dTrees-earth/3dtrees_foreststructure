@@ -437,6 +437,22 @@ julia_memory_safe_main <- function() {
       basename(point_cloud)
     ))
   }
+  point_cloud_crs <- spatial_reference_wkt(readLAScatalog(point_cloud))
+  original_companion_crs <- if (is.null(original_point_cloud)) {
+    NA_character_
+  } else {
+    spatial_reference_wkt(readLAScatalog(original_point_cloud))
+  }
+  resolved_crs <- resolve_analysis_crs(
+    point_cloud_crs,
+    original_companion_crs
+  )
+  if (identical(resolved_crs$source, "original_companion")) {
+    message(paste(
+      "COPC CRS is unavailable; using the validated original companion",
+      "header CRS for output metadata"
+    ))
+  }
   aoi_geojson <- normalizePath(arguments$aoi_geojson, mustWork = TRUE)
   input_sha256 <- sha256_file(point_cloud)
   job_directory <- tempfile(
@@ -652,7 +668,9 @@ julia_memory_safe_main <- function() {
     # Result metadata should identify the original ordered filename when known.
     point_cloud_display_name = point_cloud_display_name,
     # NULL disables sorting for LAZ; the key enables deterministic COPC sorting.
-    point_order_dimension = point_order_dimension
+    point_order_dimension = point_order_dimension,
+    # Header-only fallback preserves output CRS without reading companion points.
+    source_crs = resolved_crs$wkt
   )
   message("FORESTSTRUCTURE_STAGE stage=analysis status=started")
   run_analysis(parameters)
@@ -683,6 +701,7 @@ julia_memory_safe_main <- function() {
       requested_is_copc && !is.null(original_point_cloud)
     ),
     original_point_cloud = original_point_cloud,
+    output_crs_source = resolved_crs$source,
     # These fields make order restoration and streaming mode machine-auditable.
     point_order_dimension = point_order_dimension,
     catalog_spatial_streaming = if (requested_is_copc) "COPC" else "LAS/LAZ",
