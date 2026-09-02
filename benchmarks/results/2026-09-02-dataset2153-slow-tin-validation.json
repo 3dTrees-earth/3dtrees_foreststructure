@@ -81,5 +81,5 @@
       "reference is not a confirmed valid_updated oracle"
     ]
   },
-  "conclusion": "The legacy floating-point retry recovers the real XY integer-conversion failure without coordinate rescaling. Zero-tolerance valid_updated parity remains unproven and is required before production promotion."
+  "conclusion": "The legacy floating-point retry recovers the real XY integer-conversion failure without coordinate rescaling. Small numerical differences from earlier scaled processing are expected; preserving the original XY coordinates and LAS header is scientifically more faithful to the measured point cloud. Zero-tolerance valid_updated parity remains unproven and is required before production promotion."
 }

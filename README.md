@@ -24,7 +24,11 @@ legacy retry under 10 CPUs and a 30 GiB limit. The accepted run used 6.25 GiB
 peak cgroup memory and produced all 12 expected artifacts. This proves failure
 recovery, but not zero-tolerance `valid_updated` parity: dataset 2153 has no
 confirmed oracle in the validation cohort, and comparison with its older
-generic-COPC result found small raster and segment differences. See
+generic-COPC result found small raster and segment differences. These small
+changes are expected when the fallback triangulates the original floating-point
+XY coordinates instead of temporarily changing their scale for the integer TIN.
+Keeping the source coordinates and LAS header unchanged is scientifically more
+faithful to the measured point cloud. See
 [`COPC_REVIEW_GUIDE.md`](COPC_REVIEW_GUIDE.md) and the machine-readable
 validation record in `benchmarks/results/` before promoting this retry strategy.
 

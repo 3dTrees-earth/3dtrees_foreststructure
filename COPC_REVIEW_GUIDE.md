@@ -206,6 +206,12 @@ with its previously promoted generic-COPC result retained identical raster
 geometry and populated masks but found 800 differing DTM cells (mean absolute
 difference 0.0002 m, maximum 0.0282 m), two differing CHM cells (maximum
 0.2 m), 42 differing SAT segment fields, and 63 differing FM segment fields.
+Small numerical changes are expected because the retry now triangulates the
+original floating-point XY coordinates rather than temporarily rescaling them
+to satisfy the optimized integer TIN. Preserving the measured coordinates and
+LAS header makes this fallback scientifically more faithful than the former
+rescaling workaround.
+
 That comparison also changes input order and runtime concurrency, so it cannot
 attribute the differences solely to the TIN implementation. A confirmed
 `valid_updated` oracle replay remains required before production promotion.
