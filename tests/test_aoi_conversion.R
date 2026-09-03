@@ -1,4 +1,10 @@
 local({
+  # The GeoJSON-to-GeoPackage round trip may change only floating-point area
+  # accumulation. The acceptance boundary is inclusive at 1e-6.
+  stopifnot(isTRUE(aoi_areas_equal(0, 1e-6)))
+  stopifnot(!isTRUE(aoi_areas_equal(0, 1.000001e-6)))
+  stopifnot(!isTRUE(aoi_areas_equal(0, Inf)))
+
   ring <- rbind(
     c(0, 0),
     c(4, 0),

@@ -129,6 +129,12 @@ canonical_polygon_coordinate_signature <- function(geometry) {
   sort(signatures)
 }
 
+aoi_areas_equal <- function(expected_area, actual_area) {
+  is.finite(expected_area) &&
+    is.finite(actual_area) &&
+    abs(expected_area - actual_area) <= 1e-6
+}
+
 assert_geometry_identical <- function(expected, actual, label) {
   # GDAL may rotate a polygon ring's starting vertex while writing GeoPackage.
   # That is the same polygon, but st_equals_exact() and raw WKB are sensitive to
@@ -139,17 +145,14 @@ assert_geometry_identical <- function(expected, actual, label) {
   relation <- st_equals(expected, actual, sparse = FALSE)
   expected_summary <- geometry_summary(expected)
   actual_summary <- geometry_summary(actual)
-  area_scale <- max(
-    abs(c(expected_summary$area, actual_summary$area)),
-    1
-  )
   # sf/GDAL may rotate rings while writing. GEOS then accumulates the same
-  # shoelace terms in a different order, which can move the floating result by
-  # a few hundred ULPs for large coordinate values. Topology, exact vertices
-  # and exact bounds are checked independently below, so this tolerance covers
-  # only summation-order noise; it cannot admit a moved coordinate.
-  area_equal <- abs(expected_summary$area - actual_summary$area) <=
-    .Machine$double.eps * area_scale * 1024
+  # shoelace terms in a different order. Permit at most 1e-6 square coordinate
+  # units of absolute area noise. Topology, exact vertices and exact bounds are
+  # checked independently below, so this cannot admit a moved coordinate.
+  area_equal <- aoi_areas_equal(
+    expected_summary$area,
+    actual_summary$area
+  )
   if (!isTRUE(relation[[1, 1]]) ||
       !isTRUE(area_equal) ||
       !identical(expected_summary$bounds, actual_summary$bounds) ||
