@@ -73,7 +73,7 @@ This is the only step that defines original order. It runs before Untwine.
   validation checks pass.
 - Never publishes a partially built or invalid candidate.
 
-### `tests/validate_indexed_copc_streaming.py`
+### `validation/validate_indexed_copc_streaming.py`
 
 - Verifies exact point-count, XYZ bounds, scale, and offset equality.
 - Uses a bitset to prove that all indices from `0` through `n - 1` occur exactly
@@ -134,8 +134,8 @@ order-restoration provenance, and compares:
 - DTM and CHM geometry, populated-cell masks, and cell values at zero tolerance.
 
 The detailed comparisons live in
-`tests/compare_valid_updated_science.py` and
-`tests/compare_valid_updated_raster.R`. Both write their report before failing,
+`validation/compare_valid_updated_science.py` and
+`validation/compare_valid_updated_raster.R`. Both write their report before failing,
 so an acceptance failure retains exact row/cell counts and sampled differences.
 
 ### Cohort acceptance scripts

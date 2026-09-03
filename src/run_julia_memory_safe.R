@@ -301,13 +301,11 @@ validate_incoming_artifacts <- function(directory, dataset_id, dimensions,
   invisible(paths)
 }
 
-promote_artifacts <- function(incoming_directory, output_directory, dataset_id) {
-  incoming <- list.files(
-    incoming_directory,
-    full.names = TRUE,
-    recursive = FALSE,
-    all.files = FALSE
-  )
+promote_artifacts <- function(incoming_artifacts, output_directory, dataset_id) {
+  # Promote only paths returned by validate_incoming_artifacts(). GDAL may
+  # leave non-scientific PAM sidecars beside TIFFs; those files are cleaned up
+  # with the staging directory and never enter the published artifact set.
+  incoming <- normalizePath(incoming_artifacts, mustWork = TRUE)
   prefix_pattern <- sprintf("^%s(_|\\.)", dataset_id)
   existing <- list.files(
     output_directory,
@@ -751,7 +749,7 @@ julia_memory_safe_main <- function() {
     null = "null"
   )
   message("FORESTSTRUCTURE_STAGE stage=internal_validation status=started")
-  validate_incoming_artifacts(
+  validated_artifacts <- validate_incoming_artifacts(
     incoming_directory,
     arguments$dataset_id,
     dimensions,
@@ -775,7 +773,7 @@ julia_memory_safe_main <- function() {
   )
   message("FORESTSTRUCTURE_STAGE stage=artifact_promotion status=started")
   promoted <- promote_artifacts(
-    incoming_directory,
+    validated_artifacts,
     arguments$output_dir,
     arguments$dataset_id
   )
@@ -788,10 +786,12 @@ julia_memory_safe_main <- function() {
   invisible(promoted)
 }
 
-tryCatch(
-  julia_memory_safe_main(),
-  error = function(error) {
-    message("julia-memory-safe analysis failed: ", conditionMessage(error))
-    quit(status = 1)
-  }
-)
+if (!identical(Sys.getenv("FORESTSTRUCTURE_SOURCE_ONLY"), "1")) {
+  tryCatch(
+    julia_memory_safe_main(),
+    error = function(error) {
+      message("julia-memory-safe analysis failed: ", conditionMessage(error))
+      quit(status = 1)
+    }
+  )
+}
