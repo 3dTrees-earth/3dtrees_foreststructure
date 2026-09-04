@@ -62,6 +62,12 @@ script_directory <- if (length(script_argument)) {
 } else {
   getwd()
 }
+# Remember whether this file was intentionally sourced for focused tests before
+# temporarily suppressing the entry points of the shared implementation files.
+julia_memory_safe_source_only <- identical(
+  Sys.getenv("FORESTSTRUCTURE_SOURCE_ONLY"),
+  "1"
+)
 Sys.setenv(FORESTSTRUCTURE_SOURCE_ONLY = "1")
 source(file.path(script_directory, "run.R"))
 source(file.path(script_directory, "aoi_conversion.R"))
@@ -301,13 +307,11 @@ validate_incoming_artifacts <- function(directory, dataset_id, dimensions,
   invisible(paths)
 }
 
-promote_artifacts <- function(incoming_directory, output_directory, dataset_id) {
-  incoming <- list.files(
-    incoming_directory,
-    full.names = TRUE,
-    recursive = FALSE,
-    all.files = FALSE
-  )
+promote_artifacts <- function(incoming_artifacts, output_directory, dataset_id) {
+  # Promote only paths returned by validate_incoming_artifacts(). GDAL may
+  # leave non-scientific PAM sidecars beside TIFFs; those files are cleaned up
+  # with the staging directory and never enter the published artifact set.
+  incoming <- normalizePath(incoming_artifacts, mustWork = TRUE)
   prefix_pattern <- sprintf("^%s(_|\\.)", dataset_id)
   existing <- list.files(
     output_directory,
@@ -435,6 +439,22 @@ julia_memory_safe_main <- function() {
       "Using COPC spatial streaming with %s order restoration from %s",
       POINT_ORDER_DIMENSION,
       basename(point_cloud)
+    ))
+  }
+  point_cloud_crs <- spatial_reference_wkt(readLAScatalog(point_cloud))
+  original_companion_crs <- if (is.null(original_point_cloud)) {
+    NA_character_
+  } else {
+    spatial_reference_wkt(readLAScatalog(original_point_cloud))
+  }
+  resolved_crs <- resolve_analysis_crs(
+    point_cloud_crs,
+    original_companion_crs
+  )
+  if (identical(resolved_crs$source, "original_companion")) {
+    message(paste(
+      "COPC CRS is unavailable; using the validated original companion",
+      "header CRS for output metadata"
     ))
   }
   aoi_geojson <- normalizePath(arguments$aoi_geojson, mustWork = TRUE)
@@ -652,7 +672,9 @@ julia_memory_safe_main <- function() {
     # Result metadata should identify the original ordered filename when known.
     point_cloud_display_name = point_cloud_display_name,
     # NULL disables sorting for LAZ; the key enables deterministic COPC sorting.
-    point_order_dimension = point_order_dimension
+    point_order_dimension = point_order_dimension,
+    # Header-only fallback preserves output CRS without reading companion points.
+    source_crs = resolved_crs$wkt
   )
   message("FORESTSTRUCTURE_STAGE stage=analysis status=started")
   run_analysis(parameters)
@@ -683,6 +705,7 @@ julia_memory_safe_main <- function() {
       requested_is_copc && !is.null(original_point_cloud)
     ),
     original_point_cloud = original_point_cloud,
+    output_crs_source = resolved_crs$source,
     # These fields make order restoration and streaming mode machine-auditable.
     point_order_dimension = point_order_dimension,
     catalog_spatial_streaming = if (requested_is_copc) "COPC" else "LAS/LAZ",
@@ -732,7 +755,7 @@ julia_memory_safe_main <- function() {
     null = "null"
   )
   message("FORESTSTRUCTURE_STAGE stage=internal_validation status=started")
-  validate_incoming_artifacts(
+  validated_artifacts <- validate_incoming_artifacts(
     incoming_directory,
     arguments$dataset_id,
     dimensions,
@@ -756,7 +779,7 @@ julia_memory_safe_main <- function() {
   )
   message("FORESTSTRUCTURE_STAGE stage=artifact_promotion status=started")
   promoted <- promote_artifacts(
-    incoming_directory,
+    validated_artifacts,
     arguments$output_dir,
     arguments$dataset_id
   )
@@ -769,10 +792,12 @@ julia_memory_safe_main <- function() {
   invisible(promoted)
 }
 
-tryCatch(
-  julia_memory_safe_main(),
-  error = function(error) {
-    message("julia-memory-safe analysis failed: ", conditionMessage(error))
-    quit(status = 1)
-  }
-)
+if (!julia_memory_safe_source_only) {
+  tryCatch(
+    julia_memory_safe_main(),
+    error = function(error) {
+      message("julia-memory-safe analysis failed: ", conditionMessage(error))
+      quit(status = 1)
+    }
+  )
+}

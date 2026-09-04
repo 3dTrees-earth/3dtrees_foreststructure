@@ -1068,6 +1068,20 @@ spatial_reference_wkt <- function(value) {
   reference$wkt
 }
 
+usable_crs_wkt <- function(value) {
+  length(value) == 1L && !is.null(value) && !is.na(value) && nzchar(value)
+}
+
+resolve_analysis_crs <- function(point_cloud_crs, original_companion_crs = NA_character_) {
+  if (usable_crs_wkt(point_cloud_crs)) {
+    return(list(wkt = point_cloud_crs, source = "point_cloud"))
+  }
+  if (usable_crs_wkt(original_companion_crs)) {
+    return(list(wkt = original_companion_crs, source = "original_companion"))
+  }
+  list(wkt = NA_character_, source = "unavailable")
+}
+
 build_chunk_virtual_raster <- function(results, work_directory, label,
                                        fallback_crs = NA_character_) {
   all_paths <- complete_chunk_raster_paths(results, label)
@@ -2588,7 +2602,11 @@ run_analysis <- function(parameters) {
   total_started <- proc.time()[["elapsed"]]
   point_count <- point_count_from_las_header(parameters$point_cloud)
   assert_lidr_point_count_supported(point_count)
-  source_crs <- spatial_reference_wkt(readLAScatalog(parameters$point_cloud))
+  source_crs <- parameter_or(
+    parameters,
+    "source_crs",
+    spatial_reference_wkt(readLAScatalog(parameters$point_cloud))
+  )
   paths <- artifact_paths(parameters$output_dir, parameters$dataset_id)
   segment_work_directory <- file.path(run_work_directory, "segment_chunks")
   on.exit(

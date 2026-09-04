@@ -103,7 +103,10 @@ independently so their segment IDs and results cannot mix.
 ## Inputs and outputs
 
 The AOI is interpreted in the point cloud's local XY coordinate space and is
-not reprojected. Without an AOI, the full point-cloud extent is tiled.
+not reprojected. The GeoJSON-to-GeoPackage round trip must preserve topology,
+exact XY vertices, and exact bounds. An absolute area difference of at most
+`1e-6` square coordinate units is allowed solely for floating-point summation
+noise. Without an AOI, the full point-cloud extent is tiled.
 
 For each available instance dimension, the run writes:
 
@@ -122,6 +125,65 @@ Shared outputs are:
 
 Outputs are computed in a staging directory, validated as a complete set, and
 then promoted. A failed run does not publish a partial result set.
+
+## Validation tools
+
+Reusable acceptance checks live in `validation/`; `tests/` contains regression
+and integration orchestration. Validators return a nonzero exit code on an
+invalid result and write machine-readable JSON where a report path is accepted.
+
+Validate that ordered LAZ-to-COPC conversion preserved every indexed point and
+supported instance value:
+
+```bash
+python3 validation/validate_indexed_copc_streaming.py \
+  /data/original.laz \
+  /data/original.copc.laz \
+  /data/original.copc.order.json
+```
+
+Validate the actual GeoJSON-to-GeoPackage round trip with the image's pinned
+R, sf, and GDAL stack:
+
+```bash
+docker run --rm --network none \
+  --entrypoint Rscript \
+  --volume "$PWD:/repo:ro" \
+  --volume /data/aoi.geojson:/in/aoi.geojson:ro \
+  3dtrees-foreststructure:copc-local \
+  /repo/validation/validate_aoi_roundtrip.R \
+  /in/aoi.geojson
+```
+
+Validate a completed output directory before publishing it:
+
+```bash
+python3 validation/validate_output_artifacts.py \
+  2001 /data/attempts/2001/output \
+  --report /data/attempts/2001/output/forest_structure.validation.json
+```
+
+The report's `publish_artifacts` array is the exact file allowlist. Copy those
+files plus the new validation report; do not copy other files from the attempt
+directory.
+
+GDAL may create these non-scientific PAM metadata caches while writing the DTM
+and CHM:
+
+- `<dataset>_dtm.tif.aux.xml`
+- `<dataset>_dtm.tif.partial.tif.aux.xml`
+- `<dataset>_chm.tif.aux.xml`
+- `<dataset>_chm.tif.partial.tif.aux.xml`
+
+`validate_output_artifacts.py` reports those exact names under
+`ignored_gdal_sidecars` and excludes them from publication. No wildcard
+exception is used: every other unexpected file still fails validation. This
+allows completed datasets such as 2001 to be reviewed and published without
+recomputing their scientific outputs.
+
+For zero-tolerance comparison against `valid_updated`, use
+`validation/compare_valid_updated_science.py` for CSV and GeoJSON outputs and
+`validation/compare_valid_updated_raster.R` for DTM and CHM rasters.
 
 ## Tests
 
@@ -156,7 +218,8 @@ diagnostics, tile GeoJSON, DTM cells, and CHM cells.
 ## Repository layout
 
 - `src/` — analysis and container entrypoint code
-- `tests/` — conversion, regression, and differential validation
+- `validation/` — reusable COPC, AOI, artifact, and oracle validators
+- `tests/` — regression and integration test orchestration
 - `reference/` — unchanged scientific reference script
 - `benchmarks/` — benchmark scripts and compact result data
 - `Dockerfile.julia-memory-safe` — ordered-COPC image

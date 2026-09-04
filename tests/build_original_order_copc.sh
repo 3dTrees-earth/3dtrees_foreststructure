@@ -133,13 +133,13 @@ docker run --rm --network none \
   --memory "${container_memory_gib}g" \
   --memory-swap "${container_memory_gib}g" \
   --user "${host_uid}:${host_gid}" \
-  --volume "${repo_dir}/tests:/tests:ro" \
+  --volume "${repo_dir}/validation:/validators:ro" \
   --volume "${source_laz}:/in/original.laz:ro" \
   --volume "${temporary_copc}:/in/indexed.copc.laz:ro" \
   --volume "$(dirname "${report}"):/report" \
   --entrypoint python3 \
   "${forest_image}" \
-  /tests/validate_indexed_copc_streaming.py \
+  /validators/validate_indexed_copc_streaming.py \
   /in/original.laz /in/indexed.copc.laz \
   "/report/$(basename "${report}")" \
   >/dev/null

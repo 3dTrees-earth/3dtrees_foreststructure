@@ -44,7 +44,7 @@ while IFS=$'\t' read -r dataset_id baseline; do
 
   legacy_report="${dataset_root}/legacy_vs_valid_updated.json"
   set +e
-  /usr/bin/python3 "${repo_dir}/tests/compare_valid_updated_science.py" \
+  /usr/bin/python3 "${repo_dir}/validation/compare_valid_updated_science.py" \
     "${dataset_id}" PredInstance "${oracle_dir}" "${legacy_dir}" \
     "${legacy_report}" > "${dataset_root}/legacy_comparison.log" 2>&1
   legacy_status=$?

@@ -1,4 +1,4 @@
-.PHONY: build build-julia-memory-safe test test-julia-memory-safe test-copc-all-instance-dimensions test-dataset150 test-julia-memory-safe-dataset150 test-julia-memory-safe-dataset150-operational-aoi build-original-order-copc test-valid-updated-copc-alignment test-valid-updated-cohort test-valid-updated-oracle-cohort
+.PHONY: build build-julia-memory-safe test test-julia-memory-safe test-original-companion-crs-fallback test-artifact-promotion test-copc-all-instance-dimensions test-dataset150 test-julia-memory-safe-dataset150 test-julia-memory-safe-dataset150-operational-aoi build-original-order-copc test-valid-updated-copc-alignment test-valid-updated-cohort test-valid-updated-oracle-cohort
 
 IMAGE ?= 3dtrees-foreststructure:local
 VCS_REF ?= $(shell git rev-parse HEAD 2>/dev/null || printf unknown)
@@ -25,6 +25,21 @@ test:
 test-julia-memory-safe:
 	FORESTSTRUCTURE_JULIA_IMAGE="$(JULIA_MEMORY_SAFE_IMAGE)" \
 	bash tests/test_julia_memory_safe.sh
+
+test-original-companion-crs-fallback:
+	docker run --rm --network none \
+		--entrypoint Rscript \
+		--volume "$(CURDIR):/repo:ro" \
+		"$(JULIA_MEMORY_SAFE_IMAGE)" \
+		/repo/tests/test_original_companion_crs_fallback.R
+
+test-artifact-promotion:
+	docker run --rm --network none \
+		--entrypoint Rscript \
+		--volume "$(CURDIR):/repo:ro" \
+		--workdir /repo/src \
+		"$(JULIA_MEMORY_SAFE_IMAGE)" \
+		-e 'Sys.setenv(FORESTSTRUCTURE_SOURCE_ONLY = "1"); source("/repo/src/run_julia_memory_safe.R"); source("/repo/tests/test_artifact_promotion.R")'
 
 # Differential fixture acceptance: ordered LAZ and canonical COPC must match for
 # PredInstance, PredInstance_SAT, and PredInstance_FM under identical resources.

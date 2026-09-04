@@ -123,7 +123,7 @@ jq -e '
 ' "${candidate_dir}/${dataset_id}_julia_memory_safe_run.json" >/dev/null
 
 # Compare result rows, segment diagnostics, and GeoJSON features at zero tolerance.
-/usr/bin/python3 "${repo_dir}/tests/compare_valid_updated_science.py" \
+/usr/bin/python3 "${repo_dir}/validation/compare_valid_updated_science.py" \
   "${dataset_id}" "${dimension}" "${oracle_dir}" "${candidate_dir}" \
   "${run_root}/science_comparison.json"
 
@@ -136,11 +136,11 @@ for raster in dtm chm; do
     --memory-swap "${container_memory_gib}g" \
     --user "$(id -u):$(id -g)" \
     --entrypoint Rscript \
-    --volume "${repo_dir}/tests:/tests:ro" \
+    --volume "${repo_dir}/validation:/validators:ro" \
     --volume "${oracle_dir}/${dataset_id}_${raster}.tif:/validation/expected.tif:ro" \
     --volume "${candidate_dir}/${dataset_id}_${raster}.tif:/validation/actual.tif:ro" \
     --volume "${run_root}:/report" \
-    "${image_name}" /tests/compare_valid_updated_raster.R \
+    "${image_name}" /validators/compare_valid_updated_raster.R \
     "${raster}" /validation/expected.tif /validation/actual.tif \
     "/report/${raster}_comparison.json"
 done
