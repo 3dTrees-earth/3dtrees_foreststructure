@@ -62,6 +62,12 @@ script_directory <- if (length(script_argument)) {
 } else {
   getwd()
 }
+# Remember whether this file was intentionally sourced for focused tests before
+# temporarily suppressing the entry points of the shared implementation files.
+julia_memory_safe_source_only <- identical(
+  Sys.getenv("FORESTSTRUCTURE_SOURCE_ONLY"),
+  "1"
+)
 Sys.setenv(FORESTSTRUCTURE_SOURCE_ONLY = "1")
 source(file.path(script_directory, "run.R"))
 source(file.path(script_directory, "aoi_conversion.R"))
@@ -786,7 +792,7 @@ julia_memory_safe_main <- function() {
   invisible(promoted)
 }
 
-if (!identical(Sys.getenv("FORESTSTRUCTURE_SOURCE_ONLY"), "1")) {
+if (!julia_memory_safe_source_only) {
   tryCatch(
     julia_memory_safe_main(),
     error = function(error) {
