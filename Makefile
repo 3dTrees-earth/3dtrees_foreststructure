@@ -22,9 +22,43 @@ build-julia-memory-safe:
 test:
 	bash tests/test_container.sh
 
+.PHONY: test-galaxy-resource-request
+test-galaxy-resource-request:
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/test_galaxy_resource_request.py
+
 test-julia-memory-safe:
 	FORESTSTRUCTURE_JULIA_IMAGE="$(JULIA_MEMORY_SAFE_IMAGE)" \
 	bash tests/test_julia_memory_safe.sh
+
+.PHONY: test-production-contract
+test-production-contract:
+	docker run --rm --network none --cpus 2 --memory 1g --memory-swap 1g \
+		--entrypoint Rscript --volume "$(CURDIR)/src:/opt/foreststructure:ro" \
+		--volume "$(CURDIR)/tests:/tests:ro" "$(JULIA_MEMORY_SAFE_IMAGE)" \
+		/tests/test_production_contract.R
+	FORESTSTRUCTURE_JULIA_IMAGE="$(JULIA_MEMORY_SAFE_IMAGE)" \
+		bash tests/test_production_contract.sh
+
+.PHONY: test-projected-3d-crs
+test-projected-3d-crs:
+	FORESTSTRUCTURE_JULIA_IMAGE="$(JULIA_MEMORY_SAFE_IMAGE)" \
+		bash tests/test_projected_3d_crs.sh
+
+.PHONY: test-parallel-production
+test-parallel-production:
+	bash tests/test_parallel_production.sh
+
+.PHONY: test-denoising
+test-denoising:
+	docker run --rm --network none --cpus 2 --memory 1g --memory-swap 1g \
+		--env PYTHONDONTWRITEBYTECODE=1 --entrypoint python3 \
+		--volume "$(CURDIR):/workspace:ro" "$(JULIA_MEMORY_SAFE_IMAGE)" \
+		/workspace/tests/test_denoising_validation.py
+	docker run --rm --network none --cpus 2 --memory 4g --memory-swap 4g \
+		--entrypoint Rscript --volume "$(CURDIR):/workspace:ro" \
+		--workdir /workspace/src "$(JULIA_MEMORY_SAFE_IMAGE)" \
+		-e 'Sys.setenv(FORESTSTRUCTURE_SOURCE_ONLY = "1"); source("run.R"); source("denoising.R"); source("../tests/test_denoising.R"); source("../tests/test_height_policy.R"); source("../tests/test_segment_catalog_boundaries.R")'
+	bash tests/test_denoising.sh
 
 test-original-companion-crs-fallback:
 	docker run --rm --network none \
@@ -39,14 +73,30 @@ test-artifact-promotion:
 		--volume "$(CURDIR):/repo:ro" \
 		--workdir /repo/src \
 		"$(JULIA_MEMORY_SAFE_IMAGE)" \
-		-e 'Sys.setenv(FORESTSTRUCTURE_SOURCE_ONLY = "1"); source("/repo/src/run_julia_memory_safe.R"); source("/repo/tests/test_artifact_promotion.R")'
+		-e 'Sys.setenv(FORESTSTRUCTURE_SOURCE_ONLY = "1"); source("/repo/src/run_julia_memory_safe.R"); source("/repo/tests/test_artifact_promotion.R"); source("/repo/tests/test_companion_bounds.R"); source("/repo/tests/test_resource_validation.R")'
+
+.PHONY: test-voxel-counts
+test-voxel-counts:
+	docker run --rm --network none --cpus 2 --memory 4g --memory-swap 4g \
+		--env PYTHONDONTWRITEBYTECODE=1 --entrypoint python3 \
+		--volume "$(CURDIR):/repo:ro" "$(JULIA_MEMORY_SAFE_IMAGE)" \
+		/repo/tests/test_voxel_counts.py
+	FORESTSTRUCTURE_JULIA_IMAGE="$(JULIA_MEMORY_SAFE_IMAGE)" \
+		bash tests/test_voxel_counts.sh
 
 # Differential fixture acceptance: ordered LAZ and canonical COPC must match for
 # PredInstance, PredInstance_SAT, and PredInstance_FM under identical resources.
 test-copc-all-instance-dimensions:
+	docker run --rm --network none --cpus 2 --memory 1g --memory-swap 1g \
+		--env PYTHONDONTWRITEBYTECODE=1 --entrypoint python3 \
+		--volume "$(CURDIR):/repo:ro" "$(JULIA_MEMORY_SAFE_IMAGE)" \
+		/repo/tests/test_indexed_copc_bounds.py
 	FORESTSTRUCTURE_JULIA_IMAGE="$(JULIA_MEMORY_SAFE_IMAGE)" \
 	bash tests/test_copc_all_instance_dimensions.sh
 
+# Historical 70 m-policy replays below need their recorded image/source version;
+# set FORESTSTRUCTURE_SKIP_BUILD=1 where supported. Current acceptance is covered
+# by test-production-contract, test-parallel-production and test-denoising.
 test-dataset150:
 	bash tests/test_dataset150.sh "$(DATASET150_LAZ)"
 
@@ -64,7 +114,7 @@ test-julia-memory-safe-dataset150-operational-aoi:
 		"$(DATASET150_OPERATIONAL_AOI)" \
 		"$(JULIA_ORIGINAL_SCRIPT)"
 
-# Dataset acceptance: run canonical COPC, prove COPC provenance, then compare all
+# Historical dataset acceptance: run canonical COPC, prove COPC provenance, then compare all
 # scientific tables/vectors/rasters against the supplied Julia-faithful oracle.
 test-valid-updated-copc-alignment:
 	FORESTSTRUCTURE_JULIA_IMAGE="$(JULIA_MEMORY_SAFE_IMAGE)" \

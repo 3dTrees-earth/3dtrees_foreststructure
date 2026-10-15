@@ -114,24 +114,42 @@ This is the only step that defines original order. It runs before Untwine.
 
 ### `validation/validate_indexed_copc_streaming.py`
 
-- Verifies exact point-count, XYZ bounds, scale, and offset equality.
-- Uses a bitset to prove that all indices from `0` through `n - 1` occur exactly
+- Verifies exact point-count, stored XYZ extrema, scale and offset equality,
+  plus semantic CRS equivalence with axis order preserved. Equivalent WKT1 and
+  WKT2 serializations do not cause a false rejection.
+  Source headers may contain bounds calculated before coordinate quantization;
+  the validator records this discrepancy and compares extrema from the existing
+  point scan. Candidate header bounds must match its stored extrema exactly.
+  The optional runtime original-companion check remains header-only and snaps
+  bounds to the stored coordinate lattice to handle pre-quantization rounding.
+  It cannot replace this complete identity validation; retain the source hashes
+  and streaming comparison report as external provenance.
+- Uses a Boolean presence array to prove that all indices from `0` through `n - 1` occur exactly
   once, with no missing, duplicate, or out-of-range values.
 - Compares order-independent dual fingerprints over
   `(OriginalPointIndex, raw X, raw Y, raw Z, instance value)` for every supported
   instance dimension present in the source.
 - Reads both files in bounded chunks.
 
-The bitset gives an exact index-completeness proof. Fingerprints bind each index
+The presence array gives an exact index-completeness proof and occupies one byte
+per source point (about 1.33 GiB for 1.425 billion records). Fingerprints bind each index
 to its geometry and scientific instance value without assuming physical order.
 
 ### `src/run_julia_memory_safe.R`
 
 - Accepts canonical `.copc.laz` as the actual scientific input.
 - Rejects COPC without `OriginalPointIndex`.
-- Requires the order key and requested instance dimensions within lidR's first
-  nine ExtraBytes, preserving selective spatial streaming.
-- Skips LAX creation for COPC because COPC already carries a spatial hierarchy.
+- Reads directly from COPC when the order key and requested instance dimensions
+  are within lidR's first nine ExtraBytes. Otherwise it reuses the bounded,
+  verified projection helper to create one compact indexed scratch LAZ, retaining
+  the original order key and selected IDs. The pinned COPC reader truncates extras
+  after nine even with selector `0`; a wildcard is not a valid workaround.
+- Skips LAX creation for direct COPC. The high-ordinal fallback requires a LAX
+  beside its scratch projection. Voxel counts always read the original source.
+- Uses an optional AOI, otherwise the full-extent footprint; exports voxel counts
+  unconditionally; defaults to the `foreststructure` output prefix. Galaxy owns
+  CPU/memory allocation and job directories. `--instance-dimension` is required;
+  a missing or unsupported selection fails before analysis.
 - Optionally validates an original LAS/LAZ companion by header count and bounds.
 - Records COPC use, order restoration, selectors, and companion validation in
   the run provenance JSON.

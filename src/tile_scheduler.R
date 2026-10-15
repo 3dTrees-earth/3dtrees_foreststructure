@@ -1,8 +1,24 @@
-tile_worker_plan <- function(requested_threads, tile_count) {
+# Stable result order and one task per child bound each worker's object lifetime.
+run_bounded_tasks <- function(indices, calculate, workers,
+                              parallel_runner = parallel::mclapply) {
+  if (length(indices) > 0L && workers > 1L) {
+    parallel_runner(indices, calculate, mc.cores = workers,
+                    mc.preschedule = FALSE, mc.set.seed = FALSE)
+  } else {
+    lapply(indices, calculate)
+  }
+}
+
+tile_worker_plan <- function(requested_threads, tile_count, requested_workers = 1L) {
   requested_threads <- max(1L, as.integer(requested_threads))
+  workers <- max(1L, min(as.integer(requested_workers), requested_threads,
+                         as.integer(tile_count)))
   list(
-    process_workers = 1L,
-    threads_per_worker = requested_threads
+    process_workers = workers,
+    # Native OpenMP pools inherited across fork can deadlock when restarted
+    # with multiple threads. Forked tasks must stay single-threaded, as catalog
+    # callbacks already do; a sequential process may use the full allowance.
+    threads_per_worker = if (workers > 1L) 1L else requested_threads
   )
 }
 
@@ -28,17 +44,16 @@ collect_tile_rows <- function(
     tile_indices,
     calculate_row,
     tile_workers,
-    parallel_runner = parallel::mclapply) {
-  if (length(tile_indices) > 0L && tile_workers > 1L) {
-    rows <- parallel_runner(
-      tile_indices,
-      calculate_row,
-      mc.cores = tile_workers,
-      mc.preschedule = FALSE,
-      mc.set.seed = FALSE
-    )
+    parallel_runner = parallel::mclapply,
+    task_windows = NULL, memory_policy = NULL) {
+  runner <- function(indices, calculate, workers) {
+    run_bounded_tasks(indices, calculate, workers, parallel_runner)
+  }
+  rows <- if (is.null(memory_policy)) {
+    runner(tile_indices, calculate_row, tile_workers)
   } else {
-    rows <- lapply(tile_indices, calculate_row)
+    run_memory_admitted_tasks(tile_indices, calculate_row, tile_workers,
+      task_windows, memory_policy, "tiles", runner = runner)
   }
   validate_tile_rows(tile_indices, rows)
   if (length(rows)) {

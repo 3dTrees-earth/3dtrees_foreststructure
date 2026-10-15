@@ -3,21 +3,42 @@ set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 image_name="${FORESTSTRUCTURE_IMAGE:-3dtrees-foreststructure:test}"
-docker_limits=(--cpus "${FORESTSTRUCTURE_CPUS:-10}" --memory "${FORESTSTRUCTURE_MEMORY:-100g}")
+docker_limits=(--cpus "${FORESTSTRUCTURE_CPUS:-10}" --memory "${FORESTSTRUCTURE_MEMORY:-70g}" --memory-swap "${FORESTSTRUCTURE_MEMORY:-70g}")
 input_dir="$(mktemp -d)"
 results_dir="$(mktemp -d)"
-trap 'rm -rf "${input_dir}" "${results_dir}"' EXIT
+cleanup() {
+  local status="$?"
+  if [[ "${status}" != 0 || "${FORESTSTRUCTURE_KEEP_TEST_ROOT:-0}" == 1 ]]; then
+    echo "Container gate inputs: ${input_dir}"
+    echo "Container gate results and logs: ${results_dir} (exit ${status})"
+  else
+    rm -rf "${input_dir}" "${results_dir}"
+  fi
+}
+trap cleanup EXIT
 
 if [[ "${FORESTSTRUCTURE_SKIP_BUILD:-0}" != "1" ]]; then
   docker build --tag "${image_name}" "${repo_dir}"
 fi
+# Exercise the optional observational export in the standard publish gate too.
+docker run --rm --network none "${docker_limits[@]}" \
+  --env PYTHONDONTWRITEBYTECODE=1 --entrypoint python3 \
+  --volume "${repo_dir}:/workspace:ro" "${image_name}" \
+  /workspace/tests/test_voxel_counts.py
+python3 "${repo_dir}/tests/test_output_artifact_validation.py"
+docker run --rm --network none "${docker_limits[@]}" \
+  --env PYTHONDONTWRITEBYTECODE=1 --entrypoint python3 \
+  --volume "${repo_dir}:/workspace:ro" "${image_name}" \
+  /workspace/tests/test_denoising_validation.py
+python3 "${repo_dir}/tests/test_copc_task_counts.py"
+PYTHONDONTWRITEBYTECODE=1 python3 "${repo_dir}/tests/test_galaxy_resource_request.py"
 docker run --rm --network none \
   "${docker_limits[@]}" \
   --entrypoint Rscript \
   --volume "${repo_dir}:/workspace:ro" \
   --workdir /workspace/src \
   "${image_name}" \
-  -e 'Sys.setenv(FORESTSTRUCTURE_SOURCE_ONLY = "1"); source("run.R"); source("../tests/test_runtime_helpers.R")'
+  -e 'Sys.setenv(FORESTSTRUCTURE_SOURCE_ONLY = "1"); source("run.R"); source("denoising.R"); source("../tests/test_runtime_helpers.R"); source("../tests/test_catalog_scheduler.R"); source("../tests/test_resource_scheduler.R"); source("../tests/test_resource_memory.R"); source("../tests/test_denoising.R"); source("../tests/test_height_policy.R")'
 docker run --rm --network none \
   "${docker_limits[@]}" \
   --entrypoint Rscript \
@@ -38,14 +59,14 @@ docker run --rm --network none \
   --volume "${repo_dir}:/workspace:ro" \
   --workdir /workspace/src \
   "${image_name}" \
-  -e 'Sys.setenv(FORESTSTRUCTURE_SOURCE_ONLY = "1"); source("run.R"); source("../tests/test_julia_memory_safe.R")'
+  -e 'Sys.setenv(FORESTSTRUCTURE_SOURCE_ONLY = "1"); source("run_julia_memory_safe.R"); source("../tests/test_julia_memory_safe.R"); source("../tests/test_instance_read_groups.R"); source("../tests/test_resource_validation.R")'
 docker run --rm --network none \
   "${docker_limits[@]}" \
   --entrypoint Rscript \
   --volume "${repo_dir}:/workspace:ro" \
   --workdir /workspace/src \
   "${image_name}" \
-  -e 'Sys.setenv(FORESTSTRUCTURE_SOURCE_ONLY = "1"); source("run.R"); source("../tests/test_adaptive_chunks.R"); source("../tests/test_chm_adaptive_edges.R")'
+  -e 'Sys.setenv(FORESTSTRUCTURE_SOURCE_ONLY = "1"); source("run.R"); source("../tests/test_adaptive_chunks.R"); source("../tests/test_chm_adaptive_edges.R"); source("../tests/test_segment_catalog_boundaries.R")'
 docker run --rm --network none \
   "${docker_limits[@]}" \
   --entrypoint Rscript \
@@ -80,7 +101,8 @@ docker run --rm --network none \
   /generated/aoi_with_exclusion.gpkg
 
 help_path="${results_dir}/help.txt"
-docker run --rm --network none "${docker_limits[@]}" "${image_name}" --help > "${help_path}"
+docker run --rm --network none "${docker_limits[@]}" --user "$(id -u):$(id -g)" \
+  --entrypoint Rscript "${image_name}" /opt/foreststructure/run.R --help > "${help_path}"
 for expected_help in \
   "Optional GeoJSON or GeoPackage Audit AOI" \
   "omitted, tiles cover the complete" \
@@ -100,8 +122,26 @@ for expected_help in \
   "default: 50000000" \
   "--instance-dimension" \
   "--segment-diagnostics"; do
-  grep -q -- "${expected_help}" "${help_path}"
+  if ! grep -Fq -- "${expected_help}" "${help_path}"; then
+    echo "CLI help is missing '${expected_help}'; see ${help_path}" >&2
+    exit 1
+  fi
 done
+
+# Galaxy's Docker runner passes `/bin/bash tool_script.sh` as the command; it
+# must run as given while flag-only runs still reach the production runner.
+galaxy_command="$(docker run --rm --network none "${docker_limits[@]}" \
+  --user "$(id -u):$(id -g)" "${image_name}" /bin/bash -c 'echo galaxy-command-ok')"
+if [[ "${galaxy_command}" != "galaxy-command-ok" ]]; then
+  echo "Image did not run an explicit command: ${galaxy_command}" >&2
+  exit 1
+fi
+docker run --rm --network none "${docker_limits[@]}" --user "$(id -u):$(id -g)" \
+  "${image_name}" --help > "${results_dir}/runner_help.txt"
+if ! grep -Fq -- "--instance-dimension" "${results_dir}/runner_help.txt"; then
+  echo "Flag-only run did not reach the production runner" >&2
+  exit 1
+fi
 
 run_failure_case() {
   local name="$1"
@@ -121,7 +161,9 @@ run_failure_case() {
     --volume "${repo_dir}/tests/fixtures:/fixtures:ro" \
     --volume "${input_dir}:/in:ro" \
     --volume "${output_dir}:/out:${output_mode}" \
+    --entrypoint Rscript \
     "${image_name}" \
+    /opt/foreststructure/run.R \
     --point-cloud "${point_cloud_path}" \
     --aoi "${aoi_path}" \
     --dataset-id "${dataset_id}" \
@@ -130,7 +172,11 @@ run_failure_case() {
     echo "failure case ${name} unexpectedly succeeded" >&2
     return 1
   fi
-  grep -q -- "${expected_message}" "${log_path}"
+  if ! grep -Fq -- "${expected_message}" "${log_path}"; then
+    echo "Failure case ${name} did not report '${expected_message}'; see ${log_path}" >&2
+    tail -n 20 "${log_path}" >&2
+    return 1
+  fi
 }
 
 run_failure_case missing_point "exactly one existing LAS/LAZ file" \
@@ -147,6 +193,8 @@ run_failure_case invalid_threads "--threads must be zero or greater" \
   /in/point_cloud.laz /fixtures/aoi.geojson rw 150 --threads -1
 run_failure_case invalid_catalog_workers "--catalog-workers must be at least one" \
   /in/point_cloud.laz /fixtures/aoi.geojson rw 150 --catalog-workers 0
+run_failure_case excessive_catalog_workers "--catalog-workers must not exceed ten" \
+  /in/point_cloud.laz /fixtures/aoi.geojson rw 150 --catalog-workers 11
 run_failure_case invalid_target_chunk_points "--target-chunk-points must be zero or greater" \
   /in/point_cloud.laz /fixtures/aoi.geojson rw 150 --target-chunk-points -1
 run_failure_case malformed_aoi "must contain only Polygon or MultiPolygon" \
@@ -181,7 +229,9 @@ run_case() {
     --volume "${repo_dir}/tests/fixtures:/fixtures:ro" \
     --volume "${input_dir}:/in:ro" \
     --volume "${output_dir}:/out" \
+    --entrypoint Rscript \
     "${image_name}" \
+    /opt/foreststructure/run.R \
     --point-cloud "${point_cloud_path}" \
     "${aoi_arguments[@]}" \
     --dataset-id "${dataset_id}" \
@@ -230,3 +280,7 @@ docker run --rm --network none \
   --volume "${results_dir}:/results:ro" \
   "${image_name}" \
   /tests/verify_rasters.R /results /inputs/point_cloud.laz
+
+# Also test the production entry point that is published by the default image.
+FORESTSTRUCTURE_SKIP_BUILD=1 FORESTSTRUCTURE_JULIA_IMAGE="${image_name}" \
+  bash "${repo_dir}/tests/test_julia_memory_safe.sh"

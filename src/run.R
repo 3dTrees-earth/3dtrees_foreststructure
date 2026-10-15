@@ -73,8 +73,8 @@ parameter_or <- function(parameters, name, default) {
 validated_catalog_worker_count <- function(value, thread_budget) {
   workers <- suppressWarnings(as.integer(value))
   if (length(workers) != 1L || is.na(workers) ||
-      !workers %in% c(1L, 2L)) {
-    stop("FORESTSTRUCTURE_CATALOG_WORKERS must be 1 or 2")
+      suppressWarnings(as.numeric(value)) != workers || workers < 1L || workers > 10L) {
+    stop("FORESTSTRUCTURE_CATALOG_WORKERS must be an integer from 1 to 10")
   }
   if (workers > thread_budget) {
     stop("FORESTSTRUCTURE_CATALOG_WORKERS exceeds FORESTSTRUCTURE_THREADS")
@@ -274,6 +274,12 @@ script_directory <- if (length(script_argument)) {
   getwd()
 }
 source(file.path(script_directory, "tile_scheduler.R"))
+source(file.path(script_directory, "resource_scheduler.R"))
+source(file.path(script_directory, "catalog_scheduler.R"))
+source(file.path(script_directory, "instance_read_groups.R"))
+source(file.path(script_directory, "voxel_counts.R"))
+source(file.path(script_directory, "artifact_publication.R"))
+source(file.path(script_directory, "denoising.R"))
 
 # CLI and artifact naming ---------------------------------------------------
 
@@ -281,6 +287,7 @@ parse_parameters <- function() {
   parser <- ArgumentParser(
     description = "Compute forest-structure indices for optimized Analysis Tiles"
   )
+  add_voxel_count_arguments(parser)
   inputs <- parser$add_argument_group("Inputs")
   scientific <- parser$add_argument_group("Scientific parameters")
   runtime <- parser$add_argument_group("Runtime controls")
@@ -338,8 +345,8 @@ parse_parameters <- function() {
   scientific$add_argument(
     "--maximum-height", "--maximum_height",
     type = "double",
-    default = 70,
-    help = "Maximum normalized height retained in metres (default: 70)"
+    default = NULL,
+    help = "Optional legacy height ceiling in metres (default: no ceiling)"
   )
   scientific$add_argument(
     "--voxel-resolution", "--voxel_resolution",
@@ -457,6 +464,9 @@ parse_parameters <- function() {
     help = "Minimum occupied one-metre height layers (default: 3)"
   )
   args <- parser$parse_args()
+  # argparse generates Python code; an R Inf default is not valid Python.
+  if (is.null(args$maximum_height)) args$maximum_height <- Inf
+  validate_voxel_count_parameters(args)
 
   raw_instance_dimensions <- unlist(
     args$instance_dimension,
@@ -506,13 +516,16 @@ parse_parameters <- function() {
 
   positive <- c(
     "tile_size", "grid_search_step", "ptd_resolution", "dtm_resolution",
-    "maximum_height", "voxel_resolution", "chm_resolution", "dtm_chunk_size",
+    "voxel_resolution", "chm_resolution", "dtm_chunk_size",
     "chunk_size", "dtm_buffer"
   )
   for (name in positive) {
     if (!is.finite(args[[name]]) || args[[name]] <= 0) {
       stop(sprintf("--%s must be greater than zero", gsub("_", "-", name)))
     }
+  }
+  if (is.na(args$maximum_height) || args$maximum_height <= 0) {
+    stop("--maximum-height must be positive or Inf (no ceiling)")
   }
   if (!is.finite(args$target_chunk_points) || args$target_chunk_points < 0) {
     stop("--target-chunk-points must be zero or greater")
@@ -543,6 +556,9 @@ parse_parameters <- function() {
   }
   if (!is.finite(args$catalog_workers) || args$catalog_workers < 1) {
     stop("--catalog-workers must be at least one")
+  }
+  if (args$catalog_workers > 10L) {
+    stop("--catalog-workers must not exceed ten")
   }
   args
 }
@@ -664,6 +680,33 @@ read_audit_aoi <- function(path) {
   )
 }
 
+# Snap header bounds to their stored coordinate lattice. Some writers retain
+# pre-quantization extrema, while COPC reports the actual stored coordinates.
+# This is only an inexpensive header compatibility check, not identity proof.
+point_cloud_xyz_bounds <- function(path) {
+  # lidR exposes LAS/COPC public-header fields through the same header object.
+  header <- readLASheader(path)
+  # Return a named vector so comparison order is explicit and reviewable.
+  bounds <- c(
+    xmin = as.numeric(header@PHB[["Min X"]]),
+    ymin = as.numeric(header@PHB[["Min Y"]]),
+    zmin = as.numeric(header@PHB[["Min Z"]]),
+    xmax = as.numeric(header@PHB[["Max X"]]),
+    ymax = as.numeric(header@PHB[["Max Y"]]),
+    zmax = as.numeric(header@PHB[["Max Z"]])
+  )
+  scales <- rep(vapply(c("X", "Y", "Z"), function(axis) {
+    as.numeric(header@PHB[[paste(axis, "scale factor")]])
+  }, numeric(1)), 2L)
+  offsets <- rep(vapply(c("X", "Y", "Z"), function(axis) {
+    as.numeric(header@PHB[[paste(axis, "offset")]])
+  }, numeric(1)), 2L)
+  if (any(!is.finite(c(bounds, scales, offsets))) || any(scales <= 0)) {
+    stop("invalid LAS coordinate lattice in companion header")
+  }
+  round((bounds - offsets) / scales) * scales + offsets
+}
+
 point_cloud_xy_bounds <- function(path) {
   header <- readLASheader(path)
   bounds <- c(
@@ -680,8 +723,64 @@ point_cloud_xy_bounds <- function(path) {
   bounds
 }
 
+# The pinned catalog index requires positive-area overlap. A source point at
+# the maximum XY exactly on a chunk boundary otherwise has no scheduled owner.
+# Enlarge only in-memory file lookup bounds; source coordinates, scientific
+# chunk origins and the half-open read filters are unchanged.
+catalog_with_source_boundaries <- function(catalog, point_cloud) {
+  bounds <- point_cloud_xyz_bounds(point_cloud)[c("xmin", "ymin", "xmax", "ymax")]
+  epsilon <- pmax(1e-9, abs(bounds[3:4]) * .Machine$double.eps * 16)
+  catalog@data$Min.X <- bounds[[1L]]
+  catalog@data$Min.Y <- bounds[[2L]]
+  catalog@data$Max.X <- bounds[[3L]] + epsilon[[1L]]
+  catalog@data$Max.Y <- bounds[[4L]] + epsilon[[2L]]
+  catalog
+}
+
+# LASlib checks a file's raw header bounds before opening its spatial index.
+# When a rounded-down header maximum precedes the last stored coordinate, an
+# exact terminal query is skipped. Widen that query within the final lattice
+# interval only, so no preceding source coordinate can be read twice.
+catalog_boundary_read_adjustment <- function(point_cloud) {
+  raw <- point_cloud_xy_bounds(point_cloud)
+  stored <- point_cloud_xyz_bounds(point_cloud)
+  header <- readLASheader(point_cloud)
+  axes <- lapply(c("x", "y"), function(axis) {
+    maximum <- paste0(axis, "max")
+    if (raw[[maximum]] >= stored[[maximum]]) return(NULL)
+    scale <- as.numeric(header@PHB[[paste(toupper(axis), "scale factor")]])
+    previous <- stored[[maximum]] - scale
+    lower <- previous + (raw[[maximum]] - previous) / 2
+    if (!is.finite(lower) || !(lower > previous && lower < raw[[maximum]])) {
+      stop("unsupported source lattice: cannot safely query rounded header maximum")
+    }
+    list(raw_maximum = raw[[maximum]], stored_maximum = stored[[maximum]], lower = lower)
+  })
+  if (all(vapply(axes, is.null, logical(1)))) NULL else axes
+}
+
+adjust_catalog_boundary_read <- function(chunk, adjustment = NULL) {
+  if (is.null(adjustment)) return(chunk)
+  fields <- strsplit(trimws(chunk@filter), "[[:space:]]+")[[1L]]
+  start <- match("-inside", fields)
+  if (is.na(start) || start + 4L > length(fields)) stop("boundary adjustment requires a rectangular catalog read")
+  bounds <- suppressWarnings(as.numeric(fields[start + seq_len(4L)]))
+  if (any(!is.finite(bounds))) stop("invalid catalog boundary query")
+  for (axis in seq_len(2L)) {
+    value <- adjustment[[axis]]
+    if (!is.null(value) && bounds[[axis]] >= value$raw_maximum &&
+        bounds[[axis]] <= value$stored_maximum) {
+      fields[[start + axis]] <- format(value$lower, scientific = FALSE, trim = TRUE, digits = 17)
+    }
+  }
+  chunk@filter <- paste(fields, collapse = " ")
+  chunk
+}
+
 read_point_cloud_extent <- function(path) {
-  bounds <- point_cloud_xy_bounds(path)
+  # Use stored-coordinate extrema for the fallback AOI too: a pre-quantization
+  # header must not invalidate a complete boundary voxel.
+  bounds <- point_cloud_xyz_bounds(path)[c("xmin", "ymin", "xmax", "ymax")]
   ring <- matrix(c(
     bounds[["xmin"]], bounds[["ymin"]],
     bounds[["xmax"]], bounds[["ymin"]],
@@ -955,8 +1054,8 @@ release_point_order_dimension <- function(las, point_order_dimension = NULL) {
 # Process one DTM catalog chunk.  The optional order field is selected by the
 # catalog caller and restored immediately after reading.
 dtm_chunk <- function(chunk, dtm_resolution, ptd_resolution,
-                      point_order_dimension = NULL) {
-  lidR::set_lidr_threads(1L)
+                      point_order_dimension = NULL, denoising = NULL) {
+  configure_catalog_worker()
   las <- readLAS(chunk)
   if (is.empty(las)) return(empty_chunk_raster(chunk, dtm_resolution))
   # Treat a missing order key as a hard error before classification or TIN work.
@@ -967,6 +1066,7 @@ dtm_chunk <- function(chunk, dtm_resolution, ptd_resolution,
   )
   # Match the record sequence seen by Julia's original LAZ-based workflow.
   las <- restore_original_point_order(las, point_order_dimension, "DTM")
+  las <- apply_denoising_mask(las, denoising)
   # The order is now encoded by the rows themselves; do not retain a redundant
   # eight-byte ordinal per point through the memory-intensive PTD/TIN stages.
   las <- release_point_order_dimension(las, point_order_dimension)
@@ -1140,7 +1240,9 @@ classified_ground_surface <- function(las, dtm_resolution) {
 }
 
 assert_catalog_completed <- function(results, phase) {
-  if (length(results) == 0L || any(vapply(results, is.null, logical(1)))) {
+  if (length(results) == 0L || any(vapply(results, function(result) {
+    is.null(result) || inherits(result, "try-error")
+  }, logical(1)))) {
     stop(sprintf(
       "%s LAScatalog processing failed or returned incomplete chunks",
       phase
@@ -1306,7 +1408,7 @@ build_chunk_virtual_raster <- function(results, work_directory, label,
 gdal_raster_has_crs <- function(path) {
   info <- system2(
     "gdalinfo",
-    c("-json", shQuote(path)),
+    c("--config", "GDAL_PAM_ENABLED", "NO", "-json", shQuote(path)),
     stdout = TRUE,
     stderr = TRUE
   )
@@ -1322,6 +1424,16 @@ align_raster_file_crs <- function(path, source_crs, label) {
 
   source_has_crs <- !is.na(source_crs) && nzchar(source_crs)
   definition <- if (source_has_crs) source_crs else "None"
+  if (source_has_crs) {
+    horizontal <- system2("python3", c(
+      shQuote(file.path(script_directory, "raster_crs.py")), shQuote(source_crs)),
+      stdout = TRUE)
+    status <- attr(horizontal, "status")
+    if ((!is.null(status) && status != 0L) || !length(horizontal)) {
+      stop(sprintf("could not resolve the horizontal %s raster CRS", label))
+    }
+    definition <- paste(horizontal, collapse = "\n")
+  }
   status <- system2(
     "gdal_edit.py",
     c("-a_srs", shQuote(definition), shQuote(path))
@@ -1453,14 +1565,27 @@ raster_extent_covers_point_bounds <- function(raster_extent, point_bounds,
 
 cover_virtual_raster <- function(result, point_cloud, resolution,
                                  work_directory, label,
-                                 extent_mode = c("point_bounds", "lidr")) {
+                                 extent_mode = c("point_bounds", "lidr"),
+                                 voxel_resolution = NULL) {
   extent_mode <- match.arg(extent_mode)
   source_path <- virtual_raster_source(result, label)
-  point_bounds <- point_cloud_xy_bounds(point_cloud)
+  point_bounds <- if (is.null(voxel_resolution)) {
+    point_cloud_xy_bounds(point_cloud)
+  } else {
+    point_cloud_xyz_bounds(point_cloud)[c("xmin", "ymin", "xmax", "ymax")]
+  }
   target_bounds <- if (identical(extent_mode, "lidr")) {
     lidr_catalog_grid_bounds(point_cloud, resolution)
   } else {
     covering_grid_bounds(point_bounds, resolution)
+  }
+  if (!is.null(voxel_resolution)) {
+    # Reuse pinned voxelize_points' exact XY center arithmetic. Extend only to
+    # cells needed for source extrema, never to empty catalog-chunk rasters.
+    # Strict upper coverage retains a voxel center exactly on a raster edge.
+    centers <- lidR:::f_grid(point_bounds, voxel_resolution, 0)
+    target_bounds[1:2] <- pmin(target_bounds[1:2], floor(centers[1:2] / resolution) * resolution)
+    target_bounds[3:4] <- pmax(target_bounds[3:4], (floor(centers[3:4] / resolution) + 1) * resolution)
   }
   if (identical(extent_mode, "lidr") &&
       !raster_extent_covers_point_bounds(
@@ -1528,7 +1653,8 @@ cover_virtual_raster <- function(result, point_cloud, resolution,
 write_global_dtm <- function(point_cloud, output_path, work_directory,
                              chunk_size, dtm_buffer, dtm_resolution,
                              ptd_resolution, workers, source_crs = NULL,
-                             point_order_dimension = NULL) {
+                             point_order_dimension = NULL, memory_policy = NULL,
+                             denoising = NULL) {
   prepare_raster_work_directory(work_directory, "DTM")
   on.exit(unlink(work_directory, recursive = TRUE, force = TRUE), add = TRUE)
 
@@ -1546,22 +1672,19 @@ write_global_dtm <- function(point_cloud, output_path, work_directory,
   catalog@output_options$drivers$SpatRaster$param$datatype <- "FLT8S"
   if (is.null(source_crs)) source_crs <- spatial_reference_wkt(catalog)
 
-  results <- with_catalog_workers(
-    workers,
-    "DTM",
-    catalog_apply(
-      catalog,
-      dtm_chunk,
+  results <- apply_catalog_chunks(
+      catalog, dtm_chunk, workers, "DTM",
+      memory_policy = memory_policy,
       dtm_resolution = dtm_resolution,
       ptd_resolution = ptd_resolution,
       # Every worker restores source record order before ground/TIN operations.
       point_order_dimension = point_order_dimension,
+      denoising = denoising,
       .options = list(
         automerge = FALSE,
         drop_null = FALSE,
         raster_alignment = dtm_resolution
       )
-    )
   )
   chunk_paths <- complete_chunk_raster_paths(results, "DTM")
   mosaic <- build_dtm_overlap_mosaic(
@@ -1662,11 +1785,26 @@ record_chunk_observation <- function(directory, phase, point_count,
     fileext = ".rds"
   )
   saveRDS(
-    list(point_count = point_count, oversized = oversized),
+    list(point_count = point_count, oversized = oversized, maximum_voxel_height = NA_real_),
     path,
     compress = FALSE
   )
   invisible(path)
+}
+
+record_chunk_height <- function(path, heights) {
+  if (is.null(path)) return(invisible(NULL))
+  observation <- readRDS(path)
+  observation$maximum_voxel_height <- max(heights)
+  saveRDS(observation, path, compress = FALSE)
+  invisible(path)
+}
+
+maximum_observed_height <- function(observations) {
+  heights <- vapply(observations, function(value)
+    parameter_or(value, "maximum_voxel_height", NA_real_), numeric(1))
+  heights <- heights[is.finite(heights)]
+  if (length(heights)) max(heights) else NA_real_
 }
 
 summarize_chunk_observations <- function(directory) {
@@ -1677,7 +1815,7 @@ summarize_chunk_observations <- function(directory) {
   }
   if (length(paths) == 0L) {
     return(list(count = 0L, minimum_points = NA_real_, maximum_points = NA_real_,
-                oversized_count = 0L))
+                oversized_count = 0L, maximum_voxel_height = NA_real_))
   }
   observations <- lapply(paths, readRDS)
   points <- vapply(observations, `[[`, numeric(1), "point_count")
@@ -1686,7 +1824,8 @@ summarize_chunk_observations <- function(directory) {
     count = length(paths),
     minimum_points = min(points),
     maximum_points = max(points),
-    oversized_count = sum(oversized)
+    oversized_count = sum(oversized),
+    maximum_voxel_height = maximum_observed_height(observations)
   )
 }
 
@@ -1697,7 +1836,8 @@ combine_chunk_observations <- function(summaries) {
     count = sum(vapply(summaries, `[[`, integer(1), "count")),
     minimum_points = min(vapply(summaries, `[[`, numeric(1), "minimum_points")),
     maximum_points = max(vapply(summaries, `[[`, numeric(1), "maximum_points")),
-    oversized_count = sum(vapply(summaries, `[[`, integer(1), "oversized_count"))
+    oversized_count = sum(vapply(summaries, `[[`, integer(1), "oversized_count")),
+    maximum_voxel_height = maximum_observed_height(summaries)
   )
 }
 
@@ -1706,10 +1846,11 @@ combine_chunk_observations <- function(summaries) {
 chm_chunk <- function(chunk, dtm_path, voxel_resolution, maximum_height,
                       chm_resolution, point_order_dimension = NULL,
                       observation_directory = NULL,
-                      target_chunk_points = 0) {
-  lidR::set_lidr_threads(1L)
-  las <- readLAS(chunk)
-  record_chunk_observation(
+                      target_chunk_points = 0, denoising = NULL,
+                      boundary_read_adjustment = NULL) {
+  configure_catalog_worker()
+  las <- readLAS(adjust_catalog_boundary_read(chunk, boundary_read_adjustment))
+  observation_path <- record_chunk_observation(
     observation_directory,
     "chm",
     nrow(las@data),
@@ -1718,11 +1859,14 @@ chm_chunk <- function(chunk, dtm_path, voxel_resolution, maximum_height,
   if (is.empty(las)) return(empty_chunk_raster(chunk, chm_resolution))
   # Sort before normalization, filtering, voxelization, or canopy rasterization.
   las <- restore_original_point_order(las, point_order_dimension, "CHM")
+  las <- apply_denoising_mask(las, denoising)
+  if (is.empty(las)) return(empty_chunk_raster(chunk, chm_resolution))
   las <- normalize_height(las, terra::rast(dtm_path))
   las <- filter_poi(las, is.finite(Z) & Z >= 0 & Z <= maximum_height)
   if (is.empty(las)) return(empty_chunk_raster(chunk, chm_resolution))
   voxels <- voxelize_points(las, res = voxel_resolution)
   if (is.empty(voxels)) return(empty_chunk_raster(chunk, chm_resolution))
+  record_chunk_height(observation_path, voxels@data$Z)
   # Preserve the baseline lidR rasterization semantics.  Passing the numeric
   # resolution lets lidR derive the local extent from the chunk's populated
   # voxels; a fixed core template changes NA/value ownership for points lying
@@ -1751,17 +1895,10 @@ chm_column_maxima <- function(points) {
 # that separately per adaptive read can move a boundary point by one cell.
 # Instead retain at most one maximum per 0.2 m XY column of the baseline 60 m
 # parent (about 90,000 rows), then rasterize that parent exactly once.
-adaptive_chm_chunk <- function(chunk, dtm_path, voxel_resolution,
-                               maximum_height, chm_resolution,
-                               point_order_dimension = NULL,
-                               observation_directory = NULL,
-                               target_chunk_points = 0, read_size,
-                               source_bounds = NULL) {
-  # Bound both lidR and data.table scratch allocations inside this worker.
-  configure_catalog_worker()
+adaptive_chm_read_clusters <- function(chunk, read_size, source_bounds = NULL) {
   bounds <- sf::st_bbox(chunk)
   # LAScatalog probes callbacks with a zero-area dummy chunk before scheduling.
-  if (bounds$xmax <= bounds$xmin || bounds$ymax <= bounds$ymin) return(NULL)
+  if (bounds$xmax <= bounds$xmin || bounds$ymax <= bounds$ymin) return(list())
   x_starts <- seq(bounds$xmin, bounds$xmax, by = read_size)
   y_starts <- seq(bounds$ymin, bounds$ymax, by = read_size)
   # Header bounds safely exclude empty edge queries without moving the parent
@@ -1772,8 +1909,7 @@ adaptive_chm_chunk <- function(chunk, dtm_path, voxel_resolution,
     y_starts <- y_starts[y_starts <= source_bounds[["ymax"]] &
                            y_starts + read_size > source_bounds[["ymin"]]]
   }
-  maxima <- data.table(X = numeric(), Y = numeric(), Z = numeric())
-  header <- NULL
+  children <- list()
   # Parent chunks remain in catalog order; children stay inside their parent.
   # Reuse lidR's half-open spatial-filter constructor, with no buffer, so each
   # point belongs to precisely the same baseline parent as before adaptation.
@@ -1787,27 +1923,50 @@ adaptive_chm_chunk <- function(chunk, dtm_path, voxel_resolution,
         chunk@files, chunk@name, sf::st_crs(chunk), chunk@index
       )
       child@select <- chunk@select
-      las <- readLAS(child)
-      record_chunk_observation(observation_directory, "chm", nrow(las@data),
-                               target_chunk_points)
-      if (is.empty(las)) next
-      las <- restore_original_point_order(las, point_order_dimension, "CHM")
-      las <- normalize_height(las, terra::rast(dtm_path))
-      las <- filter_poi(las, is.finite(Z) & Z >= 0 & Z <= maximum_height)
-      if (is.empty(las)) next
-      voxels <- voxelize_points(las, res = voxel_resolution)
-      if (is.empty(voxels)) next
-      # Preserve the LAS header to avoid re-quantizing floating voxel centers
-      # when reconstructing the compact cloud for the unchanged p2r() call.
-      header <- voxels@header
-      maxima <- chm_column_maxima(rbindlist(list(
-        maxima, chm_column_maxima(voxels@data)
-      )))
-      # Release every dense table before the next spatial query. Only the tiny
-      # two-dimensional maximum table survives across reads, never 3D voxels.
-      rm(las, voxels)
-      gc(verbose = FALSE)
+      children[[length(children) + 1L]] <- child
     }
+  }
+  children
+}
+
+adaptive_chm_chunk <- function(chunk, dtm_path, voxel_resolution,
+                               maximum_height, chm_resolution,
+                               point_order_dimension = NULL,
+                               observation_directory = NULL,
+                               target_chunk_points = 0, read_size,
+                               source_bounds = NULL, denoising = NULL,
+                               boundary_read_adjustment = NULL) {
+  # Bound both lidR and data.table scratch allocations inside this worker.
+  configure_catalog_worker()
+  bounds <- sf::st_bbox(chunk)
+  if (bounds$xmax <= bounds$xmin || bounds$ymax <= bounds$ymin) return(NULL)
+  children <- adaptive_chm_read_clusters(chunk, read_size, source_bounds)
+  maxima <- data.table(X = numeric(), Y = numeric(), Z = numeric())
+  header <- NULL
+  for (child in children) {
+    las <- readLAS(adjust_catalog_boundary_read(child, boundary_read_adjustment))
+    observation_path <- record_chunk_observation(observation_directory, "chm", nrow(las@data),
+                             target_chunk_points)
+    if (is.empty(las)) next
+    las <- restore_original_point_order(las, point_order_dimension, "CHM")
+    las <- apply_denoising_mask(las, denoising)
+    if (is.empty(las)) next
+    las <- normalize_height(las, terra::rast(dtm_path))
+    las <- filter_poi(las, is.finite(Z) & Z >= 0 & Z <= maximum_height)
+    if (is.empty(las)) next
+    voxels <- voxelize_points(las, res = voxel_resolution)
+    if (is.empty(voxels)) next
+    record_chunk_height(observation_path, voxels@data$Z)
+    # Preserve the LAS header to avoid re-quantizing floating voxel centers
+    # when reconstructing the compact cloud for the unchanged p2r() call.
+    header <- voxels@header
+    maxima <- chm_column_maxima(rbindlist(list(
+      maxima, chm_column_maxima(voxels@data)
+    )))
+    # Release every dense table before the next spatial query. Only the tiny
+    # two-dimensional maximum table survives across reads, never 3D voxels.
+    rm(las, voxels)
+    gc(verbose = FALSE)
   }
   if (nrow(maxima) == 0L) return(empty_chunk_raster(chunk, chm_resolution))
   compact <- LAS(maxima, header = header, crs = sf::st_crs(chunk), check = FALSE)
@@ -1821,13 +1980,17 @@ write_global_chm <- function(point_cloud, dtm_path, output_path, work_directory,
                              chm_resolution, workers, source_crs = NULL,
                              point_order_dimension = NULL,
                              target_chunk_points = 0,
-                             raster_chunk_size = chunk_size) {
+                             raster_chunk_size = chunk_size, memory_policy = NULL,
+                             denoising = NULL) {
   prepare_raster_work_directory(work_directory, "CHM")
   on.exit(unlink(work_directory, recursive = TRUE, force = TRUE), add = TRUE)
   observation_directory <- file.path(work_directory, "observations")
   dir.create(observation_directory)
 
   catalog <- readLAScatalog(point_cloud)
+  if (!is.null(point_order_dimension)) {
+    catalog <- catalog_with_source_boundaries(catalog, point_cloud)
+  }
   opt_chunk_size(catalog) <- raster_chunk_size
   opt_chunk_alignment(catalog) <- c(0, 0)
   opt_chunk_buffer(catalog) <- 0
@@ -1843,7 +2006,13 @@ write_global_chm <- function(point_cloud, dtm_path, output_path, work_directory,
 
   # Fixed-size runs keep the original callback unchanged. Adaptive runs share
   # its normalization, voxelization and p2r semantics but bound the raw reads.
-  source_bounds <- point_cloud_xy_bounds(point_cloud)
+  source_bounds <- if (is.null(point_order_dimension)) {
+    point_cloud_xy_bounds(point_cloud)
+  } else {
+    point_cloud_xyz_bounds(point_cloud)[c("xmin", "ymin", "xmax", "ymax")]
+  }
+  boundary_read_adjustment <- if (is.null(point_order_dimension)) NULL else
+    catalog_boundary_read_adjustment(point_cloud)
   callback <- if (chunk_size < raster_chunk_size) {
     function(chunk, ...) adaptive_chm_chunk(
       chunk, ..., read_size = chunk_size, source_bounds = source_bounds
@@ -1851,12 +2020,22 @@ write_global_chm <- function(point_cloud, dtm_path, output_path, work_directory,
   } else {
     chm_chunk
   }
-  results <- with_catalog_workers(
-    workers,
-    "CHM",
-    catalog_apply(
-      catalog,
-      callback,
+  # A parent processes these child reads sequentially. Admission must reserve
+  # their largest live window, rather than all points in the 60 m parent.
+  task_windows_fn <- if (chunk_size < raster_chunk_size) {
+    function(chunk) lapply(
+      adaptive_chm_read_clusters(chunk, chunk_size, source_bounds),
+      function(child) catalog_task_window(adjust_catalog_boundary_read(child, boundary_read_adjustment))
+    )
+  } else if (!is.null(boundary_read_adjustment)) {
+    function(chunk) catalog_task_window(adjust_catalog_boundary_read(chunk, boundary_read_adjustment))
+  } else {
+    NULL
+  }
+  results <- apply_catalog_chunks(
+      catalog, callback, workers, "CHM",
+      memory_policy = memory_policy,
+      task_windows_fn = task_windows_fn,
       dtm_path = dtm_path,
       voxel_resolution = voxel_resolution,
       maximum_height = maximum_height,
@@ -1865,12 +2044,13 @@ write_global_chm <- function(point_cloud, dtm_path, output_path, work_directory,
       point_order_dimension = point_order_dimension,
       observation_directory = observation_directory,
       target_chunk_points = target_chunk_points,
+      denoising = denoising,
+      boundary_read_adjustment = boundary_read_adjustment,
       .options = list(
         automerge = FALSE,
         drop_null = FALSE,
         raster_alignment = chm_resolution
       )
-    )
   )
   result <- build_chunk_virtual_raster(
     results,
@@ -1883,7 +2063,8 @@ write_global_chm <- function(point_cloud, dtm_path, output_path, work_directory,
     point_cloud,
     chm_resolution,
     work_directory,
-    "CHM"
+    "CHM",
+    voxel_resolution = if (is.null(point_order_dimension)) NULL else voxel_resolution
   )
   stream_virtual_raster(covering, output_path, "CHM", source_crs)
   summarize_chunk_observations(observation_directory)
@@ -2021,9 +2202,10 @@ segment_chunk <- function(chunk, dtm_path, voxel_resolution, maximum_height,
                           strict_dimensions = FALSE,
                           point_order_dimension = NULL,
                           observation_directory = NULL,
-                          target_chunk_points = 0) {
+                          target_chunk_points = 0, denoising = NULL,
+                          boundary_read_adjustment = NULL) {
   configure_catalog_worker()
-  las <- readLAS(chunk)
+  las <- readLAS(adjust_catalog_boundary_read(chunk, boundary_read_adjustment))
   record_chunk_observation(
     observation_directory,
     "segment",
@@ -2053,6 +2235,8 @@ segment_chunk <- function(chunk, dtm_path, voxel_resolution, maximum_height,
   }
   selected <- instance_dimensions[instance_dimensions %in% names(las@data)]
   if (length(selected) == 0) return(list(paths = NULL))
+  las <- apply_denoising_mask(las, denoising)
+  if (is.empty(las)) return(list(paths = NULL))
   dtm <- terra::rast(dtm_path)
   las <- normalize_height(las, dtm)
   las_data <- as.data.table(las@data)
@@ -2128,12 +2312,15 @@ segment_chunk <- function(chunk, dtm_path, voxel_resolution, maximum_height,
     gc(verbose = FALSE)
     paths
   })
+  names(dimension_paths) <- selected
   paths <- do.call(c, dimension_paths)
+  # Preserve numeric bucket names for the existing disk reducer.
+  names(paths) <- unlist(lapply(dimension_paths, names), use.names = FALSE)
   # The compact RDS summaries now own everything needed by the disk reducer.
   # Release the normalized LAS and its table view before another window loads.
-  rm(las, las_data, dtm, dimension_paths)
+  rm(las, las_data, dtm)
   gc(verbose = FALSE)
-  list(paths = paths)
+  list(paths = paths, dimension_paths = dimension_paths)
 }
 
 # Configure a spatially streamed segment catalog.  The order key travels beside
@@ -2144,11 +2331,15 @@ accumulate_segments <- function(point_cloud, dtm_path, chunk_size,
                                 bucket_count = SEGMENT_BUCKET_COUNT,
                                 base_selection = SEGMENT_CATALOG_BASE_SELECTION,
                                 point_order_dimension = NULL,
-                                target_chunk_points = 0) {
+                                target_chunk_points = 0, memory_policy = NULL,
+                                denoising = NULL) {
   prepare_raster_work_directory(work_directory, "segment")
   observation_directory <- file.path(work_directory, "observations")
   dir.create(observation_directory)
   catalog <- readLAScatalog(point_cloud)
+  if (!is.null(point_order_dimension)) {
+    catalog <- catalog_with_source_boundaries(catalog, point_cloud)
+  }
   opt_chunk_size(catalog) <- chunk_size
   opt_chunk_alignment(catalog) <- c(0, 0)
   opt_chunk_buffer(catalog) <- 0
@@ -2160,16 +2351,18 @@ accumulate_segments <- function(point_cloud, dtm_path, chunk_size,
   )
   opt_select(catalog) <- selection
   opt_progress(catalog) <- FALSE
+  boundary_read_adjustment <- if (is.null(point_order_dimension)) NULL else
+    catalog_boundary_read_adjustment(point_cloud)
+  task_windows_fn <- if (is.null(boundary_read_adjustment)) NULL else function(chunk)
+    catalog_task_window(adjust_catalog_boundary_read(chunk, boundary_read_adjustment))
   message(sprintf(
     "Reading segment dimensions with LAS selection %s",
     selection
   ))
-  chunks <- with_catalog_workers(
-    workers,
-    "segment",
-    catalog_apply(
-      catalog,
-      segment_chunk,
+  chunks <- apply_catalog_chunks(
+      catalog, segment_chunk, workers, "segment",
+      memory_policy = memory_policy,
+      task_windows_fn = task_windows_fn,
       dtm_path = dtm_path,
       voxel_resolution = voxel_resolution,
       maximum_height = maximum_height,
@@ -2184,19 +2377,26 @@ accumulate_segments <- function(point_cloud, dtm_path, chunk_size,
       point_order_dimension = point_order_dimension,
       observation_directory = observation_directory,
       target_chunk_points = target_chunk_points,
+      denoising = denoising,
+      boundary_read_adjustment = boundary_read_adjustment,
       .options = list(automerge = FALSE, drop_null = FALSE)
-    )
   )
   assert_catalog_completed(chunks, "segment")
+  dimension_chunks <- setNames(lapply(instance_dimensions, function(dimension) {
+    paths <- lapply(chunks, function(chunk) chunk$dimension_paths[[dimension]])
+    Filter(function(paths) length(paths) > 0L, paths)
+  }), instance_dimensions)
   chunks <- lapply(chunks, `[[`, "paths")
   chunks <- Filter(function(paths) length(paths) > 0L, chunks)
   observations <- summarize_chunk_observations(observation_directory)
   if (length(chunks) == 0) {
-    return(list(chunks = list(), bucket_count = bucket_count,
+    return(list(chunks = list(), dimension_chunks = dimension_chunks,
+                bucket_count = bucket_count,
                 observations = observations))
   }
   list(
     chunks = chunks,
+    dimension_chunks = dimension_chunks,
     bucket_count = bucket_count,
     observations = observations
   )
@@ -2582,10 +2782,11 @@ write_segment_diagnostics <- function(segments, point_cloud, path,
   write_upstream_csv(diagnostics, path)
 }
 
-empty_metric_values <- function(voxel_total) {
+empty_metric_values <- function(voxel_total, metric_height_upper_m) {
   list(
     vox_filled = 0L,
     vox_total = voxel_total,
+    metric_height_upper_m = metric_height_upper_m,
     veg_density = NA_real_,
     zsd = NA_real_,
     zskew = NA_real_,
@@ -2607,16 +2808,67 @@ safe_round <- function(value, digits = 4) {
   round(as.numeric(value[[1]]), digits)
 }
 
+# A shared finite reference keeps density and VCI comparable between tiles.
+# This is a metric denominator, never a point filter. Reuse the exact scalar
+# maxima from the CHM pass before lidR rounds its raster to three decimals.
+# No extra cloud read, raster scan or dense vertical histogram is required.
+metric_height_reference <- function(observed, maximum_height = Inf,
+                                    vegetation_minimum_height = 0.5) {
+  if (is.finite(maximum_height)) return(maximum_height)
+  if (!is.finite(observed)) {
+    stop("Cannot derive the metric height reference without finite accepted voxel heights")
+  }
+  reference <- max(1, ceiling(observed), floor(vegetation_minimum_height) + 1)
+  if (!is.finite(reference) || reference > 2^53 - 1) {
+    stop("Observed canopy height exceeds exact numeric layer-index support")
+  }
+  reference
+}
+
+# Preserve the four used lidR::stdmetrics_z formulas without its unused dense
+# entropy histogram (whose memory grows with the largest retained height).
+tile_height_statistics <- function(z) {
+  n <- length(z)
+  centered <- z - mean(z)
+  sum_squared <- sum(centered^2)
+  list(
+    zsd = stats::sd(z),
+    zskew = (sum(centered^3) / n) / (sum_squared / n)^(3 / 2),
+    zkurt = n * sum(centered^4) / sum_squared^2,
+    # Reuse lidR's constructed probability, including its floating rounding.
+    zq90 = unname(stats::quantile(z, seq(0.05, 0.95, 0.05)[[18L]]))
+  )
+}
+
+vertical_complexity <- function(z, height_upper_m) {
+  # Julia used cut(..., seq(0, upper, 1), include.lowest=TRUE), i.e.
+  # right-closed one-metre layers. Count occupied layers only; empty layers
+  # contribute zero entropy, but remain in the normalization denominator.
+  layer_count <- floor(height_upper_m)
+  if (!is.finite(layer_count) || layer_count > 2^53 - 1 || layer_count < 1) {
+    stop("Metric height reference cannot represent one-metre layers exactly")
+  }
+  eligible <- z[is.finite(z) & z >= 0 & z <= layer_count]
+  if (!length(eligible) || layer_count == 1) return(NA_real_)
+  counts <- data.table(layer = pmax(1, ceiling(eligible)))[, .N, by = layer]$N
+  proportions <- counts / sum(counts)
+  -sum(proportions * log(proportions)) / log(layer_count)
+}
+
 # Calculate Julia-compatible tile metrics from a spatial window.  COPC still
 # supplies only the requested window; order restoration occurs after that read.
 calculate_tile_metrics <- function(point_cloud, tile, dtm, parameters) {
   bounds <- st_bbox(tile)
+  height_reference <- parameter_or(parameters, "metric_height_upper_m", parameters$maximum_height)
   voxel_total <- round(
     (parameters$tile_size / parameters$voxel_resolution)^2 *
-      ((parameters$maximum_height - parameters$vegetation_minimum_height) /
+      ((height_reference - parameters$vegetation_minimum_height) /
          parameters$voxel_resolution)
   )
-  empty <- empty_metric_values(voxel_total)
+  if (!is.finite(voxel_total) || voxel_total <= 0 || voxel_total > 2^53 - 1) {
+    stop("Metric voxel volume exceeds exact numeric support or is not positive")
+  }
+  empty <- empty_metric_values(voxel_total, height_reference)
 
   las <- readLAS(
     point_cloud,
@@ -2644,6 +2896,8 @@ calculate_tile_metrics <- function(point_cloud, tile, dtm, parameters) {
     parameters$point_order_dimension,
     "tile"
   )
+  las <- apply_denoising_mask(las, parameters$denoising)
+  if (is.empty(las)) return(empty)
 
   las <- normalize_height(las, dtm)
   las <- filter_poi(las, is.finite(Z) & Z >= 0 & Z <= parameters$maximum_height)
@@ -2653,6 +2907,9 @@ calculate_tile_metrics <- function(point_cloud, tile, dtm, parameters) {
   if (is.empty(voxels)) return(empty)
 
   height_max <- max(voxels@data$Z, na.rm = TRUE)
+  if (!is.finite(parameters$maximum_height) && height_max > height_reference) {
+    stop("Observed tile voxel height exceeds the shared metric height reference")
+  }
   height_mean <- mean(voxels@data$Z, na.rm = TRUE)
   chm <- rasterize_canopy(
     voxels,
@@ -2683,7 +2940,7 @@ calculate_tile_metrics <- function(point_cloud, tile, dtm, parameters) {
 
   vegetation_data <- as.data.table(vegetation@data)
   filled <- nrow(vegetation_data)
-  z_metrics <- cloud_metrics(vegetation, .stdmetrics_z)
+  z_metrics <- tile_height_statistics(vegetation_data$Z)
 
   voxel_indices <- unique(vegetation_data[, .(
     vx = floor(X / parameters$voxel_resolution),
@@ -2709,20 +2966,12 @@ calculate_tile_metrics <- function(point_cloud, tile, dtm, parameters) {
     NA_real_
   }
 
-  layer_breaks <- seq(0, parameters$maximum_height, by = 1)
-  layers <- cut(vegetation_data$Z, breaks = layer_breaks, include.lowest = TRUE)
-  layer_counts <- table(factor(layers, levels = levels(layers)))
-  proportions <- layer_counts / sum(layer_counts)
-  nonzero <- proportions[proportions > 0]
-  vci <- if (length(layer_counts) > 1) {
-    -sum(nonzero * log(nonzero)) / log(length(layer_counts))
-  } else {
-    NA_real_
-  }
+  vci <- vertical_complexity(vegetation_data$Z, height_reference)
 
   list(
     vox_filled = filled,
     vox_total = voxel_total,
+    metric_height_upper_m = height_reference,
     veg_density = safe_round(filled / voxel_total),
     zsd = safe_round(z_metrics$zsd),
     zskew = safe_round(z_metrics$zskew),
@@ -2766,7 +3015,8 @@ empty_result_table <- function() {
     edge_tile = logical(),
     n_tiles_plot = integer(),
     vox_filled = integer(),
-    vox_total = integer(),
+    vox_total = numeric(),
+    metric_height_upper_m = numeric(),
     veg_density = numeric(),
     zsd = numeric(),
     zskew = numeric(),
@@ -2981,6 +3231,10 @@ write_performance_report <- function(parameters, footprint_source, point_count, 
     ptd_resolution = parameters$ptd_resolution,
     dtm_resolution = parameters$dtm_resolution,
     maximum_height = parameters$maximum_height,
+    metric_height_policy = if (is.finite(parameters$maximum_height)) "explicit_legacy_ceiling" else "observed_voxel_height_v1",
+    metric_height_upper_m = parameters$metric_height_upper_m,
+    observed_maximum_voxel_height_m = parameters$observed_maximum_voxel_height_m,
+    observed_maximum_voxel_height_m_exact = sprintf("%.17g", parameters$observed_maximum_voxel_height_m),
     voxel_resolution = parameters$voxel_resolution,
     vegetation_minimum_height = parameters$vegetation_minimum_height,
     chm_resolution = parameters$chm_resolution,
@@ -3021,7 +3275,8 @@ write_performance_report <- function(parameters, footprint_source, point_count, 
     dtm_buffer = parameters$dtm_buffer,
     dtm_storage_mode = "disk_backed_vrt",
     chm_storage_mode = "disk_backed_vrt",
-    execution_mode = if (isTRUE(parameters$sequential_instance_dimensions)) {
+    execution_mode = if (identical(parameters$segment_catalog_base_selection,
+                                  JULIA_MEMORY_SAFE_SEGMENT_SELECTION)) {
       "julia_memory_safe"
     } else {
       "default"
@@ -3095,7 +3350,8 @@ run_analysis <- function(parameters) {
     point_cloud_xy_bounds(parameters$point_cloud),
     parameters$chunk_size,
     parameter_or(parameters, "target_chunk_points", 0),
-    grepl("\\.copc\\.laz$", parameters$point_cloud, ignore.case = TRUE)
+    parameter_or(parameters, "adaptive_spatial_input",
+      grepl("\\.copc\\.laz$", parameters$point_cloud, ignore.case = TRUE))
   )
   parameters$effective_chunk_size <- parameters$adaptive_chunking$chunk_size_m
   message(sprintf(
@@ -3188,7 +3444,9 @@ run_analysis <- function(parameters) {
     catalog_workers,
     source_crs,
     # Propagate the key through DTM catalog selection and per-chunk restoration.
-    parameters$point_order_dimension
+    parameters$point_order_dimension,
+    memory_policy = parameters$memory_policy,
+    denoising = parameters$denoising
   )
   dtm <- terra::rast(dtm_path)
   if (terra::inMemory(dtm)) {
@@ -3200,6 +3458,14 @@ run_analysis <- function(parameters) {
     temporary_directory_bytes(run_work_directory)
   )
   message("FORESTSTRUCTURE_STAGE stage=dtm status=completed")
+
+  if (isTRUE(parameter_or(parameters, "export_voxel_counts", FALSE))) {
+    message("FORESTSTRUCTURE_STAGE stage=voxel_counts status=started")
+    voxel_export <- write_voxel_counts(parameters, dtm_path, aoi, run_work_directory)
+    temporary_disk_peak_bytes <- max(temporary_disk_peak_bytes,
+      temporary_directory_bytes(run_work_directory) + voxel_export$temporary_disk_bytes)
+    message("FORESTSTRUCTURE_STAGE stage=voxel_counts status=completed")
+  }
 
   message("FORESTSTRUCTURE_STAGE stage=chm status=started")
   chm_started <- proc.time()[["elapsed"]]
@@ -3222,7 +3488,9 @@ run_analysis <- function(parameters) {
     } else {
       0
     },
-    raster_chunk_size = parameters$chunk_size
+    raster_chunk_size = parameters$chunk_size,
+    memory_policy = parameters$memory_policy,
+    denoising = parameters$denoising
   )
   chm_seconds <- elapsed_seconds(chm_started)
   temporary_disk_peak_bytes <- max(
@@ -3230,6 +3498,15 @@ run_analysis <- function(parameters) {
     temporary_directory_bytes(run_work_directory)
   )
   message("FORESTSTRUCTURE_STAGE stage=chm status=completed")
+
+  parameters$observed_maximum_voxel_height_m <- chm_observations$maximum_voxel_height
+  parameters$metric_height_upper_m <- metric_height_reference(
+    parameters$observed_maximum_voxel_height_m,
+    parameters$maximum_height, parameters$vegetation_minimum_height
+  )
+  message(sprintf("Metric height reference: %.10g m; normalized height ceiling: %s",
+    parameters$metric_height_upper_m,
+    if (is.finite(parameters$maximum_height)) as.character(parameters$maximum_height) else "none"))
 
   message("FORESTSTRUCTURE_STAGE stage=segmentation status=started")
   segment_started <- proc.time()[["elapsed"]]
@@ -3246,114 +3523,69 @@ run_analysis <- function(parameters) {
       "Using Instance Dimensions: %s",
       paste(instance_dimensions, collapse = ", ")
     ))
-    if (isTRUE(parameters$sequential_instance_dimensions)) {
-      for (instance_dimension in instance_dimensions) {
-        dimension_source <- parameters$dimension_point_clouds[[instance_dimension]]
-        if (is.null(dimension_source)) dimension_source <- parameters$point_cloud
-        dimension_directory <- file.path(
-          segment_work_directory,
-          gsub("[^A-Za-z0-9_-]", "_", instance_dimension)
-        )
-        message(sprintf(
-          "Starting independent segment pass for %s from %s",
-          instance_dimension,
-          basename(dimension_source)
-        ))
-        accumulated <- accumulate_segments(
-          dimension_source,
-          dtm_path,
-          parameters$effective_chunk_size,
-          parameters$voxel_resolution,
-          parameters$maximum_height,
-          instance_dimension,
-          catalog_workers,
-          dimension_directory,
-          bucket_count = parameters$segment_bucket_count,
-          base_selection = parameters$segment_catalog_base_selection,
-          # Restore source order separately in each dimension's COPC pass.
-          point_order_dimension = parameters$point_order_dimension,
-          target_chunk_points = if (parameters$adaptive_chunking$enabled) {
-            parameters$adaptive_chunking$target_points
-          } else {
-            0
-          }
-        )
-        segment_observation_summaries[[instance_dimension]] <-
-          accumulated$observations
-        dimension_segments <- if (is.null(accumulated)) {
-          NULL
-        } else {
-          assign_segments_to_tiles(
-            finalize_segment_store(accumulated, parameters),
-            tiles
-          )
-        }
-        segments_by_dimension[instance_dimension] <- list(dimension_segments)
-        if (!is.null(dimension_segments)) {
-          message(sprintf(
-            "Segment pass %s found %d segments (%d accepted trees)",
-            instance_dimension,
-            nrow(dimension_segments),
-            sum(dimension_segments$is_tree, na.rm = TRUE)
-          ))
-        }
-        temporary_disk_peak_bytes <- max(
-          temporary_disk_peak_bytes,
-          temporary_directory_bytes(run_work_directory)
-        )
-        rm(accumulated)
-        unlink(dimension_directory, recursive = TRUE, force = TRUE)
-        gc(verbose = FALSE)
-      }
-    } else {
+    read_groups <- instance_read_groups(
+      instance_dimensions,
+      parameters$point_cloud,
+      parameters$dimension_point_clouds,
+      parameters$sequential_instance_dimensions
+    )
+    for (group_index in seq_along(read_groups)) {
+      group <- read_groups[[group_index]]
+      group_directory <- file.path(segment_work_directory, paste0("read_", group_index))
+      message(sprintf(
+        "Starting segment read group %d/%d for %s from %s",
+        group_index, length(read_groups),
+        paste(group$dimensions, collapse = ", "), basename(group$source)
+      ))
       accumulated <- accumulate_segments(
-        parameters$point_cloud,
+        group$source,
         dtm_path,
         parameters$effective_chunk_size,
         parameters$voxel_resolution,
         parameters$maximum_height,
-        instance_dimensions,
+        group$dimensions,
         catalog_workers,
-        segment_work_directory,
+        group_directory,
         bucket_count = parameters$segment_bucket_count,
         base_selection = parameters$segment_catalog_base_selection,
-        # Restore source order in the combined legacy segmentation pass too.
+        # Read, restore order, and normalize once for dimensions in this source.
         point_order_dimension = parameters$point_order_dimension,
         target_chunk_points = if (parameters$adaptive_chunking$enabled) {
           parameters$adaptive_chunking$target_points
         } else {
           0
-        }
+        },
+        memory_policy = parameters$memory_policy,
+        denoising = parameters$denoising
       )
-      segment_observation_summaries[["combined"]] <- accumulated$observations
-      segments <- if (is.null(accumulated)) {
-        NULL
-      } else {
-        assign_segments_to_tiles(
-          finalize_segment_store(accumulated, parameters),
-          tiles
-        )
-      }
-      for (instance_dimension in instance_dimensions) {
-        target_dimension <- instance_dimension
-        segments_by_dimension[instance_dimension] <- list(
-          if (is.null(segments)) NULL else
-            segments[instance_dimension == target_dimension]
-        )
-      }
-      if (!is.null(segments)) {
-        message(sprintf(
-          "Global segment pass found %d segments (%d accepted trees) across %d dimension(s)",
-          nrow(segments),
-          sum(segments$is_tree, na.rm = TRUE),
-          length(instance_dimensions)
-        ))
-      }
+      # Count each physical read once, even when it supplies several dimensions.
+      segment_observation_summaries[[group_index]] <- accumulated$observations
       temporary_disk_peak_bytes <- max(
         temporary_disk_peak_bytes,
         temporary_directory_bytes(run_work_directory)
       )
+      for (instance_dimension in group$dimensions) {
+        dimension_store <- segment_store_for_dimension(accumulated, instance_dimension)
+        dimension_segments <- assign_segments_to_tiles(
+          finalize_segment_store(dimension_store, parameters), tiles
+        )
+        segments_by_dimension[instance_dimension] <- list(dimension_segments)
+        if (!is.null(dimension_segments)) {
+          message(sprintf(
+            "Segment pass %s found %d segments (%d accepted trees)",
+            instance_dimension, nrow(dimension_segments),
+            sum(dimension_segments$is_tree, na.rm = TRUE)
+          ))
+        }
+        # Reduction stays independent: SAT and FM never share an in-memory
+        # summary partition, and completed summaries release scratch promptly.
+        unlink(unlist(dimension_store$chunks, use.names = FALSE), force = TRUE)
+        rm(dimension_store)
+        gc(verbose = FALSE)
+      }
       rm(accumulated)
+      unlink(group_directory, recursive = TRUE, force = TRUE)
+      gc(verbose = FALSE)
     }
     unlink(segment_work_directory, recursive = TRUE, force = TRUE)
   }
@@ -3368,7 +3600,7 @@ run_analysis <- function(parameters) {
   message("FORESTSTRUCTURE_STAGE stage=tiles status=started")
   tile_started <- proc.time()[["elapsed"]]
   tile_indices <- seq_len(nrow(tiles))
-  tile_plan <- tile_worker_plan(thread_budget, length(tile_indices))
+  tile_plan <- tile_worker_plan(thread_budget, length(tile_indices), catalog_workers)
   tile_workers <- tile_plan$process_workers
   tile_threads_per_worker <- tile_plan$threads_per_worker
   calculate_row <- function(index) {
@@ -3395,12 +3627,16 @@ run_analysis <- function(parameters) {
   }
   if (length(tile_indices) > 0L) {
     message(sprintf(
-      "Calculating %d tile metric rows sequentially with %d lidR thread(s)",
+      "Calculating %d tile metric rows with %d process worker(s), %d lidR thread(s) each",
       length(tile_indices),
-      tile_threads_per_worker
+      tile_workers, tile_threads_per_worker
     ))
   }
-  base_result <- collect_tile_rows(tile_indices, calculate_row, tile_workers)
+  # Match the decimal bounds passed to the tile reader's -inside filter.
+  tile_windows <- lapply(tile_indices, function(index)
+    as.numeric(sprintf("%.10f", st_bbox(tiles[index, ]))))
+  base_result <- collect_tile_rows(tile_indices, calculate_row, tile_workers,
+    task_windows = tile_windows, memory_policy = parameters$memory_policy)
   tile_seconds <- elapsed_seconds(tile_started)
   message("FORESTSTRUCTURE_STAGE stage=tiles status=completed")
 
@@ -3478,8 +3714,28 @@ run_analysis <- function(parameters) {
   invisible(output_paths)
 }
 
+run_standard_analysis <- function(parameters) {
+  destination <- parameters$output_dir
+  staging <- tempfile(".incoming_", tmpdir = destination)
+  if (!dir.create(staging)) stop("cannot create analysis staging directory")
+  on.exit(unlink(staging, recursive = TRUE, force = TRUE), add = TRUE)
+  parameters$output_dir <- staging
+  dimension_paths <- run_analysis(parameters)
+  common <- artifact_paths(staging, parameters$dataset_id)
+  artifacts <- c(unlist(dimension_paths), common$dtm, common$chm, common$tiles_png,
+                 if (isTRUE(parameters$performance_report)) common$performance)
+  if (isTRUE(parameters$export_voxel_counts)) {
+    artifacts <- c(artifacts,
+      validate_voxel_count_artifacts(staging, parameters$dataset_id))
+  }
+  if (any(!file.exists(artifacts)) || any(file.info(artifacts)$size <= 0)) {
+    stop("incoming analysis artifacts missing or empty")
+  }
+  promote_artifacts(artifacts, destination, parameters$dataset_id)
+}
+
 main <- function() {
-  run_analysis(parse_parameters())
+  run_standard_analysis(parse_parameters())
 }
 
 if (!identical(Sys.getenv("FORESTSTRUCTURE_SOURCE_ONLY"), "1")) {

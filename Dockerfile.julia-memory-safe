@@ -3,12 +3,17 @@
 ARG BASE_IMAGE=3dtrees-foreststructure:v0.1.2
 FROM ${BASE_IMAGE}
 
+# Native BLAS pools otherwise start one thread per host core in every worker.
+# Parallelism belongs to the bounded catalog/tile process scheduler.
+ENV OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BLIS_NUM_THREADS=1
+
 # Embed build identity and pin the two Python packages used only by conversion
 # helpers and ExtraByte projection/validation.
 ARG VCS_REF=unknown
 ARG IMAGE_VERSION=julia-memory-safe-local
 ARG LASPY_VERSION=2.6.1
 ARG LAZRS_VERSION=0.7.0
+ARG PYPROJ_VERSION=3.7.2
 
 # This Dockerfile builds the ordered-COPC implementation at the checked-out
 # revision. See COPC_REVIEW_GUIDE.md for the input contract and design.
@@ -16,18 +21,20 @@ ARG LAZRS_VERSION=0.7.0
 # Install no recommended system extras, remove apt metadata, and pin Python LAS
 # readers so local, CI, and production images interpret ExtraBytes identically.
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends python3-pip \
+    && apt-get install --yes --no-install-recommends python3-pip python3-gdal \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m pip install --no-cache-dir --break-system-packages \
       "laspy==${LASPY_VERSION}" \
       "lazrs==${LAZRS_VERSION}" \
-    && python3 -c 'import laspy, lazrs; assert laspy.__version__ == "2.6.1"'
+      "pyproj==${PYPROJ_VERSION}" \
+    && python3 -c 'import laspy, lazrs, pyproj; from osgeo import gdal, ogr, osr; assert laspy.__version__ == "2.6.1"'
 
 # Replace only the ForestStructure runner sources; the base scientific stack is
 # intentionally inherited unchanged from v0.1.2.
 COPY src /opt/foreststructure
 # Permit arbitrary host UIDs to execute/read the copied sources in restricted runs.
-RUN chmod -R a+rX /opt/foreststructure
+RUN chmod -R a+rX /opt/foreststructure \
+    && chmod a+rx /opt/foreststructure/container_entrypoint.sh
 
 # Labels make the COPC/order/resource contract inspectable without starting the
 # image and preserve a direct link back to the exact reviewed source revision.
@@ -39,7 +46,9 @@ LABEL org.opencontainers.image.source="https://github.com/3dTrees-earth/3dtrees_
       org.opencontainers.image.version="${IMAGE_VERSION}" \
       earth.3dtrees.algorithm-base.image="3dtrees-foreststructure:v0.1.2" \
       earth.3dtrees.lidr.version="4.3.2" \
-      earth.3dtrees.memory-budget.max-gib="70" \
+      earth.3dtrees.memory-allocation.max-bytes="100000000000" \
+      earth.3dtrees.memory-headroom.fraction="0.15" \
+      earth.3dtrees.cpu.max="10" \
       earth.3dtrees.execution-mode="julia-memory-safe" \
       earth.3dtrees.dtm-tin-retry="legacy-floating-point" \
       earth.3dtrees.input-mode="original-las-or-canonical-ordered-copc" \
@@ -47,6 +56,6 @@ LABEL org.opencontainers.image.source="https://github.com/3dTrees-earth/3dtrees_
       earth.3dtrees.reference.sha256="746d57b4c937001af31e4ccd1b9f14edb5cebb15d46154ad9e20d0ce39f78226" \
       earth.3dtrees.instance-dimensions="PredInstance,PredInstance_SAT,PredInstance_FM"
 
-# Keep one explicit entry point so every run receives the same validation,
+# Keep one default runner so every flag-only run receives the same validation,
 # provenance, atomic-promotion, and COPC-order-restoration guards.
-ENTRYPOINT ["Rscript", "/opt/foreststructure/run_julia_memory_safe.R"]
+ENTRYPOINT ["/opt/foreststructure/container_entrypoint.sh"]

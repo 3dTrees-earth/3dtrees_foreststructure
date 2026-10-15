@@ -4,8 +4,6 @@ suppressPackageStartupMessages({
   library(lidR)
 })
 
-# Hard ceiling validated for this execution mode; the caller may request less.
-MAX_MEMORY_BUDGET_GIB <- 70
 # Canonical COPC files carry this UInt64 source-row key as their first ExtraByte.
 POINT_ORDER_DIMENSION <- "OriginalPointIndex"
 
@@ -14,30 +12,14 @@ is_copc_point_cloud <- function(path) {
   grepl("\\.copc\\.laz$", path, ignore.case = TRUE)
 }
 
-# Read exact header bounds without loading any point records.  These values form
-# the inexpensive companion-file identity check below.
-point_cloud_xyz_bounds <- function(path) {
-  # lidR exposes LAS/COPC public-header fields through the same header object.
-  header <- readLASheader(path)
-  # Return a named vector so comparison order is explicit and reviewable.
-  c(
-    xmin = as.numeric(header@PHB[["Min X"]]),
-    ymin = as.numeric(header@PHB[["Min Y"]]),
-    zmin = as.numeric(header@PHB[["Min Z"]]),
-    xmax = as.numeric(header@PHB[["Max X"]]),
-    ymax = as.numeric(header@PHB[["Max Y"]]),
-    zmax = as.numeric(header@PHB[["Max Z"]])
-  )
-}
-
 # The original LAZ is optional at runtime and is never used for computation.
-# When supplied, prove that it describes the same cloud as the requested COPC so
-# provenance cannot accidentally name an unrelated ordered source.
+# Reject incompatible companions without re-scanning the source. Lossless
+# preparation validation (indices and fingerprints) remains the identity proof.
 validate_original_companion <- function(requested_point_cloud, point_cloud) {
   # Compare header counts without paying the cost of two full point scans.
   requested_count <- point_count_from_las_header(requested_point_cloud)
   source_count <- point_count_from_las_header(point_cloud)
-  # Compare all six XYZ extrema at a tolerance far below source quantization.
+  # Compare the six extrema on their stored coordinate lattices.
   requested_bounds <- point_cloud_xyz_bounds(requested_point_cloud)
   source_bounds <- point_cloud_xyz_bounds(point_cloud)
   # Either disagreement means the companion cannot safely describe this COPC.
@@ -71,23 +53,29 @@ julia_memory_safe_source_only <- identical(
 Sys.setenv(FORESTSTRUCTURE_SOURCE_ONLY = "1")
 source(file.path(script_directory, "run.R"))
 source(file.path(script_directory, "aoi_conversion.R"))
+source(file.path(script_directory, "production_contract.R"))
 
 parse_julia_memory_safe_parameters <- function() {
   parser <- ArgumentParser(
     description = paste(
-      "Julia-faithful ForestStructure analysis with selective ExtraBytes",
+      "ForestStructure analysis with uncapped heights, selective ExtraBytes",
       "and disk-backed memory guards"
     )
   )
+  add_voxel_count_arguments(parser, mandatory = TRUE)
+  add_denoising_arguments(parser)
   # ``--point-cloud`` is the sole scientific input and may now be canonical COPC.
   parser$add_argument("--point-cloud", required = TRUE)
   # ``--original-point-cloud`` is optional identity/provenance evidence only.
   parser$add_argument("--original-point-cloud", default = NULL)
-  parser$add_argument("--aoi-geojson", required = TRUE)
-  parser$add_argument("--dataset-id", required = TRUE, type = "integer")
-  parser$add_argument("--output-dir", required = TRUE)
-  parser$add_argument("--temp-dir", required = TRUE)
-  parser$add_argument("--memory-budget-gib", type = "double", default = 60)
+  parser$add_argument("--aoi-geojson", default = NULL,
+    help = "Optional Audit AOI in source XY coordinates; otherwise use the full extent")
+  # Retain old batch invocations without exposing database identifiers to Galaxy.
+  parser$add_argument("--dataset-id", type = "integer", default = NULL,
+    help = "Deprecated output-prefix compatibility; not needed for production jobs")
+  parser$add_argument("--output-dir", default = getwd())
+  parser$add_argument("--temp-dir", default = Sys.getenv("TMPDIR", tempdir()))
+  parser$add_argument("--memory-budget-gib", type = "double", default = NULL)
   parser$add_argument(
     "--target-chunk-points",
     type = "double",
@@ -102,40 +90,42 @@ parse_julia_memory_safe_parameters <- function() {
   parser$add_argument(
     "--instance-dimension",
     action = "append",
-    default = NULL
+    required = TRUE,
+    help = paste(
+      "Required; repeat or comma-separate PredInstance, PredInstance_SAT or",
+      "PredInstance_FM. Every selected dimension must exist in the point cloud"
+    )
   )
   arguments <- parser$parse_args()
+  validate_voxel_count_parameters(arguments)
+  validate_denoising_options(arguments)
   raw_instance_dimensions <- unlist(
     arguments$instance_dimension,
     recursive = TRUE,
     use.names = FALSE
   )
-  if (is.null(raw_instance_dimensions) ||
-      length(raw_instance_dimensions) == 0L ||
-      all(is.na(raw_instance_dimensions))) {
-    arguments$instance_dimension <- c(
-      "PredInstance",
-      "PredInstance_SAT",
-      "PredInstance_FM"
-    )
-  } else {
-    raw_instance_dimensions <- raw_instance_dimensions[
-      !is.na(raw_instance_dimensions)
-    ]
-    arguments$instance_dimension <- unique(trimws(unlist(strsplit(
-      as.character(raw_instance_dimensions),
-      ",",
-      fixed = TRUE
-    ))))
-    arguments$instance_dimension <- arguments$instance_dimension[
-      nzchar(arguments$instance_dimension)
-    ]
+  raw_instance_dimensions <- raw_instance_dimensions[
+    !is.na(raw_instance_dimensions)
+  ]
+  arguments$instance_dimension <- unique(trimws(unlist(strsplit(
+    as.character(raw_instance_dimensions),
+    ",",
+    fixed = TRUE
+  ))))
+  arguments$instance_dimension <- arguments$instance_dimension[
+    nzchar(arguments$instance_dimension)
+  ]
+  if (!length(arguments$instance_dimension)) {
+    stop("--instance-dimension must name at least one instance dimension")
   }
   if (!file.exists(arguments$point_cloud) ||
       !grepl("\\.la[sz]$", arguments$point_cloud, ignore.case = TRUE)) {
     stop("--point-cloud must be exactly one existing LAS/LAZ file")
   }
   # COPC accepts an optional non-COPC companion; computation still reads COPC.
+  if (arguments$denoise != "none" && !is_copc_point_cloud(arguments$point_cloud)) {
+    stop("--denoise requires a canonical COPC with OriginalPointIndex")
+  }
   if (is_copc_point_cloud(arguments$point_cloud)) {
     # Reject a missing, wrongly typed, or second-COPC companion before staging.
     if (!is.null(arguments$original_point_cloud) &&
@@ -155,26 +145,21 @@ parse_julia_memory_safe_parameters <- function() {
   } else if (!is.null(arguments$original_point_cloud)) {
     stop("--original-point-cloud is only valid when --point-cloud is a COPC")
   }
-  if (!file.exists(arguments$aoi_geojson) ||
-      !grepl("\\.(geojson|json)$", arguments$aoi_geojson, ignore.case = TRUE)) {
+  if (!is.null(arguments$aoi_geojson) && (!file.exists(arguments$aoi_geojson) ||
+      !grepl("\\.(geojson|json)$", arguments$aoi_geojson, ignore.case = TRUE))) {
     stop("--aoi-geojson must be exactly one existing GeoJSON file")
   }
-  if (!is.finite(arguments$dataset_id) || arguments$dataset_id < 1) {
+  if (!is.null(arguments$dataset_id) && (!is.finite(arguments$dataset_id) || arguments$dataset_id < 1)) {
     stop("--dataset-id must be a positive integer")
   }
+  if (is.null(arguments$dataset_id)) arguments$dataset_id <- "foreststructure"
   for (directory in c(arguments$output_dir, arguments$temp_dir)) {
     if (!dir.exists(directory) || file.access(directory, mode = 2) != 0) {
       stop("output and temporary directories must exist and be writable")
     }
   }
-  if (!is.finite(arguments$memory_budget_gib) ||
-      arguments$memory_budget_gib <= 0 ||
-      arguments$memory_budget_gib > MAX_MEMORY_BUDGET_GIB) {
-    stop(sprintf(
-      "--memory-budget-gib must be greater than zero and at most %s",
-      MAX_MEMORY_BUDGET_GIB
-    ))
-  }
+  arguments$resources <- production_resources(arguments$memory_budget_gib)
+  arguments$memory_budget_gib <- arguments$resources$memory_budget_gib
   if (!is.finite(arguments$target_chunk_points) ||
       arguments$target_chunk_points < 0) {
     stop("--target-chunk-points must be zero or greater")
@@ -200,10 +185,10 @@ run_projection <- function(source, output, dimension) {
   output_lines <- system2(
     "python3",
     c(
-      file.path(script_directory, "project_instance_dimension.py"),
-      "--source", source,
-      "--output", output,
-      "--dimension", dimension
+      shQuote(file.path(script_directory, "project_instance_dimension.py")),
+      "--source", shQuote(source),
+      "--output", shQuote(output),
+      unlist(lapply(dimension, function(name) c("--dimension", shQuote(name))))
     ),
     stdout = TRUE,
     stderr = TRUE
@@ -212,14 +197,15 @@ run_projection <- function(source, output, dimension) {
   if (!is.null(status) && status != 0L) {
     stop(sprintf(
       "streaming projection failed for %s: %s",
-      dimension,
+      paste(dimension, collapse = ", "),
       paste(output_lines, collapse = " ")
     ))
   }
   fromJSON(tail(output_lines, 1L), simplifyVector = FALSE)
 }
 
-expected_artifacts <- function(directory, dataset_id, dimensions) {
+expected_artifacts <- function(directory, dataset_id, dimensions, voxel_counts = FALSE,
+                               denoising = FALSE) {
   prefix <- file.path(directory, as.character(dataset_id))
   common <- c(
     paste0(prefix, "_dtm.tif"),
@@ -235,19 +221,40 @@ expected_artifacts <- function(directory, dataset_id, dimensions) {
     paste0(prefix, suffix, "_segment_diagnostics.csv"),
     paste0(prefix, suffix, "_tiles.geojson")
   )))
-  c(common, dimension_files)
+  c(common, dimension_files, if (voxel_counts) unlist(voxel_count_paths(directory, dataset_id)),
+    if (denoising) paste0(prefix, c("_noise_points.csv", "_denoising.json")))
+}
+
+validate_performance_resources <- function(performance, memory_budget_gib,
+                                           source_point_count,
+                                           memory_limit_gib = memory_budget_gib) {
+  if (nrow(performance) != 1L ||
+      performance$point_count[[1]] != source_point_count ||
+      !is.finite(performance$peak_rss_mib[[1]]) ||
+      performance$peak_rss_mib[[1]] >= memory_budget_gib * 1024 ||
+      !is.finite(performance$cgroup_memory_peak_mib[[1]]) ||
+      # Kernel usage includes reclaimable disk cache. Compare that peak with the
+      # allocation; the smaller internal budget governs working-set admission.
+      performance$cgroup_memory_peak_mib[[1]] > memory_limit_gib * 1024 ||
+      !is.finite(performance$temporary_disk_peak_mib[[1]])) {
+    stop("incoming artifact validation failed: performance/resource checks failed")
+  }
+  invisible(TRUE)
 }
 
 validate_incoming_artifacts <- function(directory, dataset_id, dimensions,
                                         memory_budget_gib, source_point_count,
-                                        point_cloud_name, sensor, country) {
+                                        point_cloud_name, sensor, country, voxel_counts = FALSE,
+                                        memory_limit_gib = memory_budget_gib,
+                                        denoising = FALSE) {
   matches_label <- function(values, expected) {
     if (identical(expected, "NA")) {
       return(all(is.na(values) | as.character(values) == "NA"))
     }
     all(!is.na(values) & as.character(values) == expected)
   }
-  paths <- expected_artifacts(directory, dataset_id, dimensions)
+  paths <- expected_artifacts(directory, dataset_id, dimensions, voxel_counts, denoising)
+  if (voxel_counts) validate_voxel_count_artifacts(directory, dataset_id)
   absent <- paths[!file.exists(paths) | file.info(paths)$size <= 0]
   if (length(absent) > 0L) {
     stop(sprintf(
@@ -255,18 +262,20 @@ validate_incoming_artifacts <- function(directory, dataset_id, dimensions,
       paste(basename(absent), collapse = ", ")
     ))
   }
+  if (denoising) {
+    status <- system2("python3", c(
+      shQuote(file.path(script_directory, "denoising_validation.py")),
+      shQuote(file.path(directory, paste0(dataset_id, "_denoising.json"))),
+      shQuote(file.path(directory, paste0(dataset_id, "_noise_points.csv"))),
+      "--point-count", format(source_point_count, scientific = FALSE, trim = TRUE)
+    ))
+    if (status != 0L) stop("incoming denoising accounting validation failed")
+  }
   performance <- fread(
     file.path(directory, paste0(dataset_id, "_performance.csv"))
   )
-  if (nrow(performance) != 1L ||
-      performance$point_count[[1]] != source_point_count ||
-      !is.finite(performance$peak_rss_mib[[1]]) ||
-      performance$peak_rss_mib[[1]] >= memory_budget_gib * 1024 ||
-      !is.finite(performance$cgroup_memory_peak_mib[[1]]) ||
-      performance$cgroup_memory_peak_mib[[1]] >= memory_budget_gib * 1024 ||
-      !is.finite(performance$temporary_disk_peak_mib[[1]])) {
-    stop("incoming artifact validation failed: performance/resource checks failed")
-  }
+  validate_performance_resources(performance, memory_budget_gib,
+                                 source_point_count, memory_limit_gib)
   dtm <- terra::rast(file.path(directory, paste0(dataset_id, "_dtm.tif")))
   chm <- terra::rast(file.path(directory, paste0(dataset_id, "_chm.tif")))
   if (terra::inMemory(dtm) || terra::inMemory(chm) ||
@@ -320,52 +329,6 @@ validate_incoming_artifacts <- function(directory, dataset_id, dimensions,
   invisible(paths)
 }
 
-promote_artifacts <- function(incoming_artifacts, output_directory, dataset_id) {
-  # Promote only paths returned by validate_incoming_artifacts(). GDAL may
-  # leave non-scientific PAM sidecars beside TIFFs; those files are cleaned up
-  # with the staging directory and never enter the published artifact set.
-  incoming <- normalizePath(incoming_artifacts, mustWork = TRUE)
-  prefix_pattern <- sprintf("^%s(_|\\.)", dataset_id)
-  existing <- list.files(
-    output_directory,
-    pattern = prefix_pattern,
-    full.names = TRUE,
-    recursive = FALSE,
-    all.files = FALSE
-  )
-  backup_directory <- tempfile(
-    pattern = sprintf(".backup_%s_", dataset_id),
-    tmpdir = output_directory
-  )
-  dir.create(backup_directory)
-  promoted <- character()
-  success <- FALSE
-  on.exit({
-    if (!success) {
-      unlink(promoted, force = TRUE)
-      backup <- list.files(backup_directory, full.names = TRUE)
-      for (path in backup) {
-        file.rename(path, file.path(output_directory, basename(path)))
-      }
-    }
-    unlink(backup_directory, recursive = TRUE, force = TRUE)
-  }, add = TRUE)
-
-  for (path in existing) {
-    if (!file.rename(path, file.path(backup_directory, basename(path)))) {
-      stop(sprintf("cannot stage existing artifact %s for replacement", path))
-    }
-  }
-  for (path in incoming) {
-    target <- file.path(output_directory, basename(path))
-    if (!file.rename(path, target)) {
-      stop(sprintf("cannot atomically promote %s", basename(path)))
-    }
-    promoted <- c(promoted, target)
-  }
-  success <- TRUE
-  invisible(promoted)
-}
 
 package_versions <- function() {
   packages <- c(
@@ -470,7 +433,14 @@ julia_memory_safe_main <- function() {
       "header CRS for output metadata"
     ))
   }
-  aoi_geojson <- normalizePath(arguments$aoi_geojson, mustWork = TRUE)
+  aoi_geojson <- if (is.null(arguments$aoi_geojson)) NULL else
+    normalizePath(arguments$aoi_geojson, mustWork = TRUE)
+  definitions <- extra_byte_definitions(point_cloud)
+  source_definitions <- definitions
+  available <- vapply(definitions, function(definition) definition$name, character(1))
+  dimensions <- production_instance_dimensions(available, arguments$instance_dimension)
+  arguments$instance_dimension <- dimensions
+  missing <- character()
   input_sha256 <- sha256_file(point_cloud)
   job_directory <- tempfile(
     pattern = sprintf("foreststructure_%s_", arguments$dataset_id),
@@ -493,6 +463,22 @@ julia_memory_safe_main <- function() {
   if (!file.symlink(point_cloud, staged_point_cloud)) {
     stop("cannot stage original point cloud by local-SSD symbolic link")
   }
+  copc_projection <- NULL
+  required_dimensions <- unique(c(point_order_dimension, dimensions))
+  if (requested_is_copc && any(match(required_dimensions, available) > 9L)) {
+    # Pinned rlas truncates COPC ExtraBytes after field nine even with selector 0.
+    # Reuse the verified bounded projection once, retaining the source-order key
+    # and all selected IDs, then spatially index that compact scratch LAZ.
+    projected <- file.path(job_directory, "analysis_projection.laz")
+    copc_projection <- run_projection(staged_point_cloud, projected, required_dimensions)
+    staged_point_cloud <- projected
+    rlas::writelax(staged_point_cloud)
+    if (!file.exists(sub("\\.laz$", ".lax", staged_point_cloud))) {
+      stop("failed to spatially index high-ordinal COPC projection")
+    }
+    definitions <- extra_byte_definitions(staged_point_cloud)
+    available <- vapply(definitions, function(definition) definition$name, character(1))
+  }
   # Plain LAS/LAZ benefits from a sidecar LAX; COPC already contains its spatial
   # hierarchy and must not be rewritten or supplemented with a LAX index.
   if (!requested_is_copc) {
@@ -509,17 +495,31 @@ julia_memory_safe_main <- function() {
     }
   }
 
+  thread_count <- arguments$resources$threads
+  worker_request <- Sys.getenv("FORESTSTRUCTURE_CATALOG_WORKERS", "")
+  catalog_worker_count <- validated_catalog_worker_count(
+    if (nzchar(worker_request)) worker_request else as.character(min(10L, thread_count)),
+    thread_count
+  )
+  message(sprintf(
+    "Using validated Julia-memory-safe catalog worker count: %d",
+    catalog_worker_count
+  ))
+
   message("FORESTSTRUCTURE_STAGE stage=aoi_conversion status=started")
-  generated_gpkg <- file.path(
-    job_directory,
-    paste0(tools::file_path_sans_ext(basename(point_cloud)), ".gpkg")
-  )
-  aoi_provenance <- convert_geojson_to_gpkg(
-    aoi_geojson,
-    generated_gpkg,
-    point_cloud_xy_bounds(staged_point_cloud),
-    tile_threads = 1L
-  )
+  generated_gpkg <- NULL
+  if (is.null(aoi_geojson)) {
+    footprint <- read_analysis_footprint(staged_point_cloud)
+    aoi_provenance <- c(list(source = "point_cloud_extent", source_geojson = NULL),
+                        geometry_summary(footprint$usable))
+  } else {
+    generated_gpkg <- file.path(job_directory, "analysis_aoi.gpkg")
+    aoi_provenance <- convert_geojson_to_gpkg(
+      aoi_geojson, generated_gpkg, point_cloud_xy_bounds(staged_point_cloud),
+      tile_threads = thread_count
+    )
+    aoi_provenance$source <- "audit_aoi"
+  }
   write_json(
     aoi_provenance,
     file.path(
@@ -532,36 +532,7 @@ julia_memory_safe_main <- function() {
   message("FORESTSTRUCTURE_STAGE stage=aoi_conversion status=completed")
 
   message("FORESTSTRUCTURE_STAGE stage=dimension_projection status=started")
-  definitions <- extra_byte_definitions(staged_point_cloud)
-  available <- vapply(definitions, function(definition) {
-    definition$name
-  }, character(1))
-  dimensions <- arguments$instance_dimension[
-    arguments$instance_dimension %in% available
-  ]
-  missing <- setdiff(arguments$instance_dimension, dimensions)
-  if (length(missing) > 0L) {
-    message(sprintf(
-      "Skipping missing Instance Dimensions: %s",
-      paste(missing, collapse = ", ")
-    ))
-  }
-  # lidR can selectively request only ExtraBytes 1-9 from COPC.  Requiring the
-  # key and requested instance fields in that window keeps reads spatial and
-  # avoids silently falling back to repeated full-cloud scans.
-  if (requested_is_copc) {
-    selective_dimensions <- unique(c(point_order_dimension, dimensions))
-    selective_ordinals <- match(selective_dimensions, available)
-    unsupported <- selective_dimensions[selective_ordinals > 9L]
-    if (length(unsupported) > 0L) {
-      stop(paste(
-        "COPC selective streaming requires OriginalPointIndex and requested",
-        "instance dimensions among the first nine ExtraBytes; rebuild the",
-        "COPC with build_original_order_copc.sh. Unsupported:",
-        paste(unsupported, collapse = ", ")
-      ))
-    }
-  }
+  # High-ordinal COPC fields are now in the verified indexed scratch projection.
 
   # Track the actual source and selector used for each instance dimension; these
   # maps feed both execution and the durable provenance report.
@@ -573,11 +544,11 @@ julia_memory_safe_main <- function() {
     # ExtraByte ordinal maps directly to lidR selector digits 1-9.
     ordinal <- match(dimension, available)
     definition <- definitions[[ordinal]]
-    # Canonical COPC guarantees streamable placement.  Plain LAZ may still need
-    # a one-dimension projection when its field is beyond lidR's selector window.
+    # Plain LAZ retains its existing verified streaming projection fallback.
     if (ordinal <= 9L || requested_is_copc) {
       dimension_sources[[dimension]] <- staged_point_cloud
-      selector <- if (ordinal <= 9L) paste0("xyz", ordinal) else "xyz0"
+      selector <- catalog_selection_for_dimensions(staged_point_cloud,
+        c(point_order_dimension, dimension), "xyz")
     } else {
       projection_path <- file.path(
         job_directory,
@@ -623,19 +594,6 @@ julia_memory_safe_main <- function() {
   message(sprintf("SELECTOR phase=tile selector=%s", point_order_selector))
   message("FORESTSTRUCTURE_STAGE stage=dimension_projection status=completed")
 
-  thread_count <- suppressWarnings(as.integer(Sys.getenv(
-    "FORESTSTRUCTURE_THREADS",
-    "20"
-  )))
-  if (!is.finite(thread_count) || thread_count < 1L) thread_count <- 20L
-  catalog_worker_count <- validated_catalog_worker_count(
-    Sys.getenv("FORESTSTRUCTURE_CATALOG_WORKERS", "1"),
-    thread_count
-  )
-  message(sprintf(
-    "Using validated Julia-memory-safe catalog worker count: %d",
-    catalog_worker_count
-  ))
   segment_bucket_count <- suppressWarnings(as.integer(Sys.getenv(
     "FORESTSTRUCTURE_SEGMENT_BUCKET_COUNT",
     as.character(SEGMENT_BUCKET_COUNT)
@@ -645,10 +603,15 @@ julia_memory_safe_main <- function() {
       segment_bucket_count > 65536L) {
     stop("FORESTSTRUCTURE_SEGMENT_BUCKET_COUNT must be an integer from 1 to 65536")
   }
-  # Preserve Julia's scientific constants exactly.  Only storage, selection,
-  # resource controls, and record-order restoration differ in this runner.
+  # Preserve Julia's other scientific constants; accepted normalized heights
+  # have no ceiling. Metric denominators use the exact CHM-pass voxel maxima.
   parameters <- list(
     point_cloud = staged_point_cloud,
+    point_cloud_sha256 = input_sha256,
+    voxel_point_cloud = point_cloud,
+    adaptive_spatial_input = requested_is_copc,
+    export_voxel_counts = arguments$export_voxel_counts,
+    voxel_count_chunk_points = arguments$voxel_count_chunk_points,
     dataset_id = arguments$dataset_id,
     aoi = generated_gpkg,
     output_dir = incoming_directory,
@@ -657,7 +620,7 @@ julia_memory_safe_main <- function() {
     grid_search_step = 0.5,
     ptd_resolution = 20,
     dtm_resolution = 1,
-    maximum_height = 70,
+    maximum_height = Inf,
     voxel_resolution = 0.2,
     vegetation_minimum_height = 0.5,
     chm_resolution = 0.5,
@@ -678,7 +641,10 @@ julia_memory_safe_main <- function() {
     sensor = arguments$sensor,
     country = arguments$country,
     memory_budget_gib = arguments$memory_budget_gib,
-    sequential_instance_dimensions = TRUE,
+    # Original COPC hierarchy also bounds projected reads: projection preserves
+    # coordinates and records. Never estimate those from the flat LAZ header.
+    memory_policy = resource_policy(point_cloud, arguments$memory_budget_gib, job_directory),
+    sequential_instance_dimensions = FALSE,
     segment_catalog_base_selection = JULIA_MEMORY_SAFE_SEGMENT_SELECTION,
     segment_bucket_count = segment_bucket_count,
     # Per-dimension sources support legacy LAZ projection without changing COPC.
@@ -690,13 +656,46 @@ julia_memory_safe_main <- function() {
     # Header-only fallback preserves output CRS without reading companion points.
     source_crs = resolved_crs$wkt
   )
+  denoise_started <- proc.time()[["elapsed"]]
+  parameters$denoising <- prepare_denoising_mask(
+    staged_point_cloud, point_order_dimension, arguments,
+    file.path(job_directory, "denoising"), catalog_worker_count,
+    parameters$memory_policy
+  )
+  denoise_seconds <- if (is.null(parameters$denoising)) 0 else elapsed_seconds(denoise_started)
+  denoise_provenance <- list(enabled = FALSE, method = "none")
+  if (!is.null(parameters$denoising)) {
+    parameters$denoising$summary$source_sha256 <- input_sha256
+    parameters$denoising$summary$source_name <- basename(requested_point_cloud)
+    parameters$denoising$summary$elapsed_seconds <- denoise_seconds
+    parameters$denoising$summary$voxel_policy <- paste(
+      "original source records; noise mask is not applied to voxel counts;",
+      "normalization uses the DTM fitted after denoising"
+    )
+    denoise_provenance <- parameters$denoising$summary
+    assert_memory_budget(parameters$denoising$lookup_reserve_bytes,
+                         parameters, "denoising quality artifact export")
+    write_denoising_artifacts(parameters$denoising,
+      file.path(incoming_directory, as.character(arguments$dataset_id)))
+    # A small adaptive read can intersect a large classification partition.
+    # Reserve the largest complete mask partition for every downstream worker;
+    # lookup releases each partition before opening the next one.
+    parameters$memory_policy$task_fixed_bytes <-
+      parameters$memory_policy$task_fixed_bytes + parameters$denoising$lookup_reserve_bytes
+  }
   message("FORESTSTRUCTURE_STAGE stage=analysis status=started")
   run_analysis(parameters)
   message("FORESTSTRUCTURE_STAGE stage=analysis status=completed")
   performance <- fread(file.path(
     incoming_directory,
     paste0(arguments$dataset_id, "_performance.csv")
-  ))
+  ), colClasses = c(observed_maximum_voxel_height_m_exact = "character"))
+  if (!is.null(parameters$denoising)) {
+    performance[, denoise_seconds := denoise_seconds]
+    performance[, total_seconds := total_seconds + denoise_seconds]
+    fwrite(performance, file.path(incoming_directory,
+      paste0(arguments$dataset_id, "_performance.csv")), na = "NA")
+  }
   temporary_disk_peak_mib <- performance$temporary_disk_peak_mib[[1]] +
     temporary_directory_bytes(job_directory) / 1024^2
 
@@ -704,7 +703,10 @@ julia_memory_safe_main <- function() {
   # restored original order, and optionally validated the original companion.
   run_provenance <- list(
     status = "candidate",
-    mode = "julia-memory-safe",
+    mode = if (is.null(parameters$denoising)) "julia-memory-safe" else "julia-memory-safe-local-sor",
+    denoising = denoise_provenance,
+    voxel_counts = list(enabled = arguments$export_voxel_counts,
+      metadata = if (arguments$export_voxel_counts) paste0(arguments$dataset_id, "_voxel_counts.json") else NULL),
     rerun_policy = "always_recompute_then_replace_after_validation",
     source_point_cloud = normalizePath(point_cloud, mustWork = TRUE),
     source_point_cloud_sha256 = input_sha256,
@@ -720,17 +722,32 @@ julia_memory_safe_main <- function() {
     ),
     original_point_cloud = original_point_cloud,
     output_crs_source = resolved_crs$source,
+    source_crs_wkt = resolved_crs$wkt,
+    raster_crs_wkt = terra::crs(terra::rast(file.path(
+      incoming_directory, paste0(arguments$dataset_id, "_dtm.tif")))),
+    raster_crs_policy = "horizontal CRS embedded in GeoTIFF; no coordinate or height transformation",
     # These fields make order restoration and streaming mode machine-auditable.
     point_order_dimension = point_order_dimension,
-    catalog_spatial_streaming = if (requested_is_copc) "COPC" else "LAS/LAZ",
+    catalog_spatial_streaming = if (!is.null(copc_projection)) "indexed LAZ projection" else
+      if (requested_is_copc) "COPC" else "LAS/LAZ",
+    copc_projection = copc_projection,
     requested_instance_dimensions = arguments$instance_dimension,
     processed_instance_dimensions = dimensions,
+    instance_read_groups = instance_read_groups(
+      dimensions, staged_point_cloud, dimension_sources,
+      parameters$sequential_instance_dimensions
+    ),
     missing_instance_dimensions = missing,
     extra_byte_definitions = definitions,
+    source_extra_byte_definitions = source_definitions,
     selectors = selectors,
     projections = projections,
     catalog_workers = catalog_worker_count,
+    catalog_worker_policy = if (nzchar(worker_request)) "explicit_cap" else "auto_up_to_ten",
+    resource_admission = resource_plan_reports(parameters$memory_policy),
     data_table_threads = DATA_TABLE_THREADS,
+    scheduler_resources = arguments$resources,
+    footprint_source = aoi_provenance$source,
     segment_bucket_count = segment_bucket_count,
     memory_budget_gib = arguments$memory_budget_gib,
     parent_peak_rss_mib = performance$peak_rss_mib[[1]],
@@ -779,7 +796,12 @@ julia_memory_safe_main <- function() {
       dtm_buffer = 20,
       segment_chunk_size = performance$adaptive_chunk_size_m[[1]],
       voxel_resolution = 0.2,
-      maximum_height = 70,
+      maximum_height = NULL,
+      normalized_height_policy = "finite_nonnegative_without_upper_cutoff",
+      metric_height_policy = performance$metric_height_policy[[1]],
+      metric_height_upper_m = performance$metric_height_upper_m[[1]],
+      observed_maximum_voxel_height_m = performance$observed_maximum_voxel_height_m[[1]],
+      observed_maximum_voxel_height_m_exact = performance$observed_maximum_voxel_height_m_exact[[1]],
       vegetation_minimum_height = 0.5,
       chm_resolution = 0.5,
       gap_height_threshold = 3,
@@ -811,7 +833,12 @@ julia_memory_safe_main <- function() {
     point_count_from_las_header(point_cloud),
     point_cloud_display_name,
     arguments$sensor,
-    arguments$country
+    arguments$country,
+    voxel_counts = arguments$export_voxel_counts,
+    memory_limit_gib = if (is.null(arguments$resources$memory_limit_gib)) {
+      arguments$memory_budget_gib
+    } else arguments$resources$memory_limit_gib,
+    denoising = !is.null(parameters$denoising)
   )
   message("FORESTSTRUCTURE_STAGE stage=internal_validation status=completed")
   run_provenance$status <- "valid"

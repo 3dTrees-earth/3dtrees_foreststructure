@@ -10,14 +10,14 @@ mkdir -p "${test_root}/input" "${test_root}/output" "${test_root}/work"
 if [[ "${FORESTSTRUCTURE_SKIP_BUILD:-0}" != "1" ]]; then
   docker build --file "${repo_dir}/Dockerfile.julia-memory-safe" --tag "${image_name}" "${repo_dir}"
 fi
-docker run --rm --network none --user "$(id -u):$(id -g)" --entrypoint Rscript --volume "${repo_dir}/tests:/tests:ro" --volume "${test_root}/input:/generated" "${image_name}" /tests/generate_julia_memory_safe_fixture.R /generated/high_ordinal.laz /generated/aoi.geojson
+docker run --rm --network none --env FORESTSTRUCTURE_FIXTURE_EPSG=32632 --user "$(id -u):$(id -g)" --entrypoint Rscript --volume "${repo_dir}/tests:/tests:ro" --volume "${test_root}/input:/generated" "${image_name}" /tests/generate_julia_memory_safe_fixture.R /generated/high_ordinal.laz /generated/aoi.geojson
 
 run_candidate() {
   local bucket_count="${1:-64}"
   local sensor="${2:-ULS}"
   local country="${3:-Test}"
   local memory_budget_gib="${4:-3}"
-  docker run --rm --network none --cpus 2 --memory 4g --memory-swap 4g --user "$(id -u):$(id -g)" --env FORESTSTRUCTURE_THREADS=2 --env "FORESTSTRUCTURE_SEGMENT_BUCKET_COUNT=${bucket_count}" --volume "${test_root}/input/high_ordinal.laz:/in/high_ordinal.laz:ro" --volume "${test_root}/input/aoi.geojson:/in/aoi.geojson:ro" --volume "${test_root}/output:/out" --volume "${test_root}/work:/work" "${image_name}" --point-cloud /in/high_ordinal.laz --aoi-geojson /in/aoi.geojson --dataset-id 150 --output-dir /out --temp-dir /work --memory-budget-gib "${memory_budget_gib}" --sensor "${sensor}" --country "${country}"
+  docker run --rm --network none --cpus 2 --memory 4g --memory-swap 4g --user "$(id -u):$(id -g)" --env FORESTSTRUCTURE_THREADS=2 --env "FORESTSTRUCTURE_SEGMENT_BUCKET_COUNT=${bucket_count}" --volume "${test_root}/input/high_ordinal.laz:/in/high_ordinal.laz:ro" --volume "${test_root}/input/aoi.geojson:/in/aoi.geojson:ro" --volume "${test_root}/output:/out" --volume "${test_root}/work:/work" "${image_name}" --denoise none --point-cloud /in/high_ordinal.laz --aoi-geojson /in/aoi.geojson --dataset-id 150 --output-dir /out --temp-dir /work --memory-budget-gib "${memory_budget_gib}" --sensor "${sensor}" --country "${country}" --instance-dimension PredInstance,PredInstance_SAT,PredInstance_FM
 }
 
 run_candidate 2>&1 | tee "${test_root}/first.log"
@@ -41,13 +41,13 @@ test -z "$(find "${test_root}/work" -mindepth 1 -print -quit)"
 run_candidate 256 NA NA 70 2>&1 | tee "${test_root}/second.log"
 grep -q 'Validated and promoted' "${test_root}/second.log"
 jq -e '.segment_bucket_count == 256' "${test_root}/output/150_julia_memory_safe_run.json" >/dev/null
-jq -e '.memory_budget_gib == 70' "${test_root}/output/150_julia_memory_safe_run.json" >/dev/null
+jq -e '.memory_budget_gib == 3.4' "${test_root}/output/150_julia_memory_safe_run.json" >/dev/null
 
 failure_output="${test_root}/failure_output"
 failure_work="${test_root}/failure_work"
 mkdir -p "${failure_output}" "${failure_work}"
 set +e
-docker run --rm --network none --cpus 2 --memory 4g --memory-swap 4g --user "$(id -u):$(id -g)" --env FORESTSTRUCTURE_THREADS=2 --volume "${test_root}/input/high_ordinal.laz:/in/high_ordinal.laz:ro" --volume "${test_root}/input/aoi.geojson:/in/aoi.geojson:ro" --volume "${failure_output}:/out" --volume "${failure_work}:/work" "${image_name}" --point-cloud /in/high_ordinal.laz --aoi-geojson /in/aoi.geojson --dataset-id 151 --output-dir /out --temp-dir /work --memory-budget-gib 0.0001 --instance-dimension PredInstance > "${test_root}/budget_failure.log" 2>&1
+docker run --rm --network none --cpus 2 --memory 4g --memory-swap 4g --user "$(id -u):$(id -g)" --env FORESTSTRUCTURE_THREADS=2 --volume "${test_root}/input/high_ordinal.laz:/in/high_ordinal.laz:ro" --volume "${test_root}/input/aoi.geojson:/in/aoi.geojson:ro" --volume "${failure_output}:/out" --volume "${failure_work}:/work" "${image_name}" --denoise none --point-cloud /in/high_ordinal.laz --aoi-geojson /in/aoi.geojson --dataset-id 151 --output-dir /out --temp-dir /work --memory-budget-gib 0.0001 --instance-dimension PredInstance > "${test_root}/budget_failure.log" 2>&1
 failure_status="$?"
 set -e
 if [[ "${failure_status}" == "0" ]]; then

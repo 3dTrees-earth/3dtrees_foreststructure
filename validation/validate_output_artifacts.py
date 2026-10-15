@@ -34,7 +34,8 @@ def as_list(value: Any) -> list[Any]:
     return [value]
 
 
-def expected_artifact_names(dataset_id: int, processed: list[str]) -> set[str]:
+def expected_artifact_names(dataset_id: int | str, processed: list[str], voxel_counts: bool = False,
+                            denoising: bool = False) -> set[str]:
     """Return the exact scientific and provenance artifact contract."""
 
     names = {
@@ -45,18 +46,23 @@ def expected_artifact_names(dataset_id: int, processed: list[str]) -> set[str]:
         f"{dataset_id}_aoi_conversion.json",
         f"{dataset_id}_julia_memory_safe_run.json",
     }
-    for dimension in processed:
+    for dimension in processed or [""]:
+        prefix = f"{dataset_id}_{dimension}" if dimension else str(dataset_id)
         names.update(
             {
-                f"{dataset_id}_{dimension}_results.csv",
-                f"{dataset_id}_{dimension}_segment_diagnostics.csv",
-                f"{dataset_id}_{dimension}_tiles.geojson",
+                f"{prefix}_results.csv",
+                f"{prefix}_segment_diagnostics.csv",
+                f"{prefix}_tiles.geojson",
             }
         )
+    if voxel_counts:
+        names.update(f"{dataset_id}_voxel_counts{suffix}" for suffix in (".csv", ".tif", ".json", "_validity.tif"))
+    if denoising:
+        names.update((f"{dataset_id}_noise_points.csv", f"{dataset_id}_denoising.json"))
     return names
 
 
-def allowed_gdal_sidecar_names(dataset_id: int) -> set[str]:
+def allowed_gdal_sidecar_names(dataset_id: int | str) -> set[str]:
     """Return only the known non-scientific DTM/CHM PAM filenames."""
 
     return {
@@ -66,7 +72,7 @@ def allowed_gdal_sidecar_names(dataset_id: int) -> set[str]:
     }
 
 
-def validate_output_directory(dataset_id: int, output: Path) -> dict[str, Any]:
+def validate_output_directory(dataset_id: int | str, output: Path) -> dict[str, Any]:
     """Return a machine-readable artifact validation report."""
 
     errors: list[str] = []
@@ -100,7 +106,9 @@ def validate_output_directory(dataset_id: int, output: Path) -> dict[str, Any]:
     if provenance and provenance.get("status") != "valid":
         errors.append("provenance status is not valid")
 
-    expected = expected_artifact_names(dataset_id, processed)
+    expected = expected_artifact_names(dataset_id, processed,
+        provenance.get("voxel_counts", {}).get("enabled", False),
+        provenance.get("denoising", {}).get("enabled", False))
     present = {path.name for path in output.iterdir() if path.is_file()}
     allowed_sidecars = allowed_gdal_sidecar_names(dataset_id)
     ignored_sidecars = sorted(present & allowed_sidecars)
@@ -146,7 +154,7 @@ def write_report(report: dict[str, Any], path: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("dataset_id", type=int)
+    parser.add_argument("dataset_id", help="Output prefix: foreststructure, or a legacy dataset ID")
     parser.add_argument("output_directory", type=Path)
     parser.add_argument("--report", type=Path)
     arguments = parser.parse_args()
